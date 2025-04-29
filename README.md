@@ -1,7 +1,7 @@
 
 ```ini
 [<YOUR GITHUB USER>/<YOUR GITHUB REPOSITORY>]
-db_url = https://raw.githubusercontent.com/<YOUR GITHUB USER>/<YOUR GITHUB REPOSITORY>/db/db.json.zip
+db_url = https://raw.githubusercontent.com/jemaeld/jd_MiSTer/db/db.json.zip
 ```
 
 
