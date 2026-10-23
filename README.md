@@ -35,11 +35,16 @@ La carpeta `_Arcade/@JD_Extras/` se instala en `/media/fat/_Arcade/@JD_Extras/` 
 
 Estos MRAs necesitan que tengas en `games/mame` los `.zip` de ROM correspondientes y el core indicado en cada MRA. Los scripts solo revisan `_Arcade` (no sus subcarpetas), así que `missingRFB.sh` y `missingarcaderoms.sh` no analizan esta carpeta.
 
+## Configuración
+
+`Backups/MiSTer.ini` es mi `MiSTer.ini` (salida HDMI a 2560x1440, HDR, integer scale y el `main` de Zaparoo). Se guarda aquí como respaldo y no en la raíz a propósito: así Downloader no sobrescribe el `MiSTer.ini` activo en `/media/fat/`. Para usarlo, cópialo a `/media/fat/MiSTer.ini`.
+
 ## Estructura del repositorio
 
 ```
 Scripts/              Scripts para MiSTer (se instalan en /media/fat/Scripts)
 _Arcade/@JD_Extras/   MRAs extras (se instalan en /media/fat/_Arcade/@JD_Extras)
+Backups/              Respaldo de configuración (MiSTer.ini)
 external_files.csv    Archivos externos que se descargan desde otras URLs
 .github/workflows/    Workflow que genera db.json.zip en la rama "db"
 ```
