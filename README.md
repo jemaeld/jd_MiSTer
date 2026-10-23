@@ -25,10 +25,21 @@ Se instalan en `/media/fat/Scripts/` y aparecen en el menú **Scripts** de MiSTe
 
 > `missingRFB.sh` modifica los archivos `.mra` en el modo normal. Si quieres ver qué cambiaría antes de aplicarlo, ejecútalo por SSH con `./missingRFB.sh --dry-run`.
 
+## MRAs extras
+
+La carpeta `_Arcade/@JD_Extras/` se instala en `/media/fat/_Arcade/@JD_Extras/` y contiene MRAs de hacks, betas y variantes que no vienen en las distribuciones oficiales:
+
+- Street Fighter II: `sf2mix`, `sf2prime`, Champion Re-Edit y Special Champion Edition Arcade Sr Street
+- Mortal Kombat: Ultimate Mortal Kombat 3 PLUS (Beta 2) y Mortal Kombat II PLUS (Beta 2)
+- Namco System 12: Soul Calibur (World, US ALT y Japan JP ALT), Fighting Layer (Asia y Japan ALT) y Ehrgeiz
+
+Estos MRAs necesitan que tengas en `games/mame` los `.zip` de ROM correspondientes y el core indicado en cada MRA. Los scripts solo revisan `_Arcade` (no sus subcarpetas), así que `missingRFB.sh` y `missingarcaderoms.sh` no analizan esta carpeta.
+
 ## Estructura del repositorio
 
 ```
 Scripts/              Scripts para MiSTer (se instalan en /media/fat/Scripts)
+_Arcade/@JD_Extras/   MRAs extras (se instalan en /media/fat/_Arcade/@JD_Extras)
 external_files.csv    Archivos externos que se descargan desde otras URLs
 .github/workflows/    Workflow que genera db.json.zip en la rama "db"
 ```

@@ -1,0 +1,71 @@
+<misterromdescription>
+  <!-- Custom byte-split layout for Mortal Kombat II Plus Beta 2 -->
+  <about author="rejectedcoins" />
+  <rotation>horizontal</rotation>
+  <name>Mortal Kombat II Plus (Beta 2)</name>
+  <setname>mk2p</setname>
+  <parent>mk2</parent>
+  <mameversion>0289</mameversion>
+  <year>2020</year>
+  <manufacturer>Hack (Hack by MKII+ Team)</manufacturer>
+  <players>2</players>
+  <rbf>TUnitDCS_20260828</rbf>
+  <joystick>8-way</joystick>
+  <region>World</region>
+
+  <!-- Descriptor -->
+  <rom index="3">
+    <part>54 01 01 01 01 01 01 54</part>
+  </rom>
+
+  <!-- Main Game Code Layer -->
+  <rom index="0" zip="mk2p.zip" md5="None" type="merged|nonmerged">
+    <part name="uj12.l31" />
+    <part name="ug12.l31" />
+  </rom>
+
+  <!-- Graphics Layer: Re-ordered to match the 1MB file parts -->
+  <rom index="1" zip="mk2p.zip" md5="None" type="merged|nonmerged">
+    <part name="ug14-vid" />
+    <part name="uj14-vid" />
+    <part name="ug19-vid" />
+    <part name="uj19-vid" />
+    <part name="ug16-vid" />
+    <part name="uj16-vid" />
+    <part name="ug20-vid" />
+    <part name="uj20-vid" />
+    <part name="ug17-vid" />
+    <part name="uj17-vid" />
+    <part name="ug22-vid" />
+    <part name="uj22-vid" />
+  </rom>
+
+  <!-- Sound Audio Layer: Using your native 512KB audio dumps -->
+  <rom index="2" zip="mk2p.zip" md5="None" type="merged|nonmerged">
+    <part name="su2.l1" />
+    <part name="su3.l1" />
+    <part name="su4.l1" />
+    <part name="su5.l1" />
+    <part name="su6.l1" />
+    <part name="su7.l1" />
+  </rom>
+
+  <nvram index="4" size="16384" />
+
+  <switches default="7D,FC">
+    <dip name="Test Switch" bits="0" ids="On,Off" />
+    <dip name="Counters" bits="1" ids="Two,One" />
+    <dip name="Coinage" bits="2,3,4,5,6" ids="-,German-Free Play,French-Free Play,USA-Free Play,-,German-4,French-4,USA-4,-,German-ECA,-,-,-,German-2,French-2,USA-2,-,-,-,-,-,German-3,French-3,USA-3,-,German-5,French-ECA,USA-ECA,-,German-1,French-1,USA-1" />
+    <dip name="Coinage Source" bits="7" ids="CMOS,Dipswitch" />
+    <dip name="Circuit Boards" bits="8" ids="1,2" />
+    <dip name="Powerup Test" bits="9" ids="Off,On" />
+    <dip name="Bill Validator" bits="10" ids="Installed,Not Present" />
+    <dip name="Comic Book Offer" bits="11" ids="Off,On" />
+    <dip name="Attract Sound" bits="12" ids="Off,On" />
+    <dip name="Low Blows" bits="13" ids="Off,On" />
+    <dip name="Blood" bits="14" ids="Off,On" />
+    <dip name="Violence" bits="15" ids="Off,On" />
+  </switches>
+
+  <buttons names="High Punch,Low Punch,Block,High Kick,Low Kick,Block 2,Start,Coin" default="X,Y,A,B,R,L,Start,Select" count="6" />
+</misterromdescription>
