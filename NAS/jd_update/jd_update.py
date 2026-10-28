@@ -1885,10 +1885,11 @@ def record_history(root, dry_run, mode="symlink"):
 
 
 def az_letter(name):
-    """A-Z segun la primera letra del nombre (sin acentos); cualquier otra cosa -> '#'."""
+    """Carpeta segun la primera letra del nombre (sin acentos): _A ... _Z; cualquier otra cosa -> _#.
+    El prefijo '_' es obligatorio: el MiSTer solo muestra las carpetas que empiezan con _."""
     n = unicodedata.normalize("NFD", name.strip())
     c = n[:1]
-    return c.upper() if c.isascii() and c.isalpha() else "#"
+    return "_" + (c.upper() if c.isascii() and c.isalpha() else "#")
 
 
 def build_special(root, plan, runs):
@@ -1923,9 +1924,9 @@ def build_special(root, plan, runs):
                 add(cur, s, cur)
         used = set()
         for run in reversed(rr[-1 - PAST_KEEP:-1]):
-            label = run["date"][:16]
+            label = "_" + run["date"][:16]          # con '_' para que el MiSTer la muestre
             if label in used:
-                label = run["date"]
+                label = "_" + run["date"]
             used.add(label)
             for r in run[key]:
                 s = src_for(r)
