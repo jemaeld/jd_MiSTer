@@ -51,6 +51,8 @@ python3 jd_update.py all      # actualizar + organizar + revisar y copiar ROMs
 
 Ajusta `SOURCE_DIR` al inicio del script con la ruta de tus ROMs.
 
+Para leer `JD_Check.log` sin salir de la terminal: opción `v` del menú, o `python3 jd_update.py log` (`--section N` muestra una sección, `--grep texto` busca en todo el log).
+
 Para traer de aquí el script y las listas (`jd_update.list`, `jd_exclude.list`) a tu NAS: opción `g` del menú, o `python3 jd_update.py github` (`github-lists` solo trae las listas). Muestra qué cambia, pide confirmación y guarda copia `.bak`.
 
 ## Configuración

@@ -15,6 +15,7 @@ Sin argumentos abre un MENU numerado. Tambien se puede usar directo (cron, scrip
     python3 jd_update.py rebuild         # check + crea zips "solucionables" a partir de tus zips
     python3 jd_update.py rescan          # regenera jd_roms.db (indice de la fuente)
     python3 jd_update.py all             # update + organize + copy
+    python3 jd_update.py log             # lee JD_Check.log en la terminal (por secciones, con busqueda)
     python3 jd_update.py github          # trae de GitHub el script y las listas (jd_update.list, jd_exclude.list)
     python3 jd_update.py github-lists    # igual, pero solo las listas
     python3 jd_update.py undo-organize   # quita lo que creo el organizador
@@ -50,6 +51,7 @@ import os
 import platform
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -1819,7 +1821,7 @@ def print_summary(root, R, args):
     log(f"Zips declarados ausentes pero innecesarios (merged): {len(R.unneeded)} MRA | zips por conseguir: {len(R.need_zips)}")
     log(f"Cores .rbf Missing: {len(R.missing_cores)} | problemas de MRA: {len(R.mra_problems)} | zips danados: {len(R.bad_zips)}")
     log(f"Info: .rbf sin MRA: {len(R.orphans)} | cores con varias versiones: {len(R.multi)}")
-    log(f"Log: {STATE_DIR / args.log}")
+    log(f"Log: {STATE_DIR / args.log}   (para leerlo aqui: python3 jd_update.py log, o la opcion v del menu)")
 
 
 # =====================================================================
@@ -2127,6 +2129,128 @@ def cmd_github(root, args, only_lists=False):
         log("El script se actualizo: vuelve a ejecutarlo para usar la version nueva.")
 
 
+# =====================================================================
+#  VER EL LOG EN LA TERMINAL
+# =====================================================================
+def read_log_sections(path):
+    """-> (encabezado, [[titulo, [lineas]]]). Las secciones empiezan con '=== '."""
+    head, secs, cur = [], [], None
+    for ln in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if ln.startswith("=== "):
+            cur = [ln.strip("= ").strip(), []]
+            secs.append(cur)
+        elif cur is None:
+            head.append(ln)
+        else:
+            cur[1].append(ln)
+    return head, secs
+
+
+def page_lines(lines):
+    """Muestra las lineas con paginador (less si existe; si no, de a pantalla con Enter)."""
+    if not lines:
+        print("(vacio)")
+        return
+    if not (sys.stdout.isatty() and sys.stdin and sys.stdin.isatty()):
+        print("\n".join(lines))
+        return
+    size = shutil.get_terminal_size((100, 30))
+    if len(lines) <= size.lines - 2:
+        print("\n".join(lines))
+        return
+    less = shutil.which("less")
+    if less:
+        try:
+            subprocess.run([less, "-R"], input=("\n".join(lines) + "\n").encode("utf-8", errors="replace"))
+            return
+        except OSError:
+            pass
+    step = max(10, size.lines - 2)
+    for i in range(0, len(lines), step):
+        print("\n".join(lines[i:i + step]))
+        if i + step < len(lines):
+            try:
+                if input(f"-- {min(i + step, len(lines))}/{len(lines)} | Enter: seguir, q: salir -- ").strip().lower() == "q":
+                    return
+            except (EOFError, KeyboardInterrupt):
+                return
+
+
+def short_title(t, n=96):
+    return t if len(t) <= n else t[:n - 3] + "..."
+
+
+def grep_log(head, secs, text, limit=500):
+    needle, out = text.lower(), []
+    for ln in head:
+        if needle in ln.lower():
+            out.append(f"[encabezado] {ln}")
+    for i, (title, body) in enumerate(secs, 1):
+        for ln in body:
+            if needle in ln.lower():
+                out.append(f"[{i}] {ln}")
+    total = len(out)
+    out = out[:limit] + ([f"... {total - limit} coincidencias mas (afina la busqueda)"] if total > limit else [])
+    return out or [f"(sin coincidencias para '{text}')"]
+
+
+def pick_section(secs, key):
+    key = (key or "").strip()
+    if key.isdigit() and 1 <= int(key) <= len(secs):
+        return int(key) - 1
+    for i, (title, _b) in enumerate(secs):
+        if key.lower() in title.lower():
+            return i
+    return None
+
+
+def cmd_log(root, args):
+    path = STATE_DIR / args.log
+    if not path.is_file():
+        log(f"No hay log todavia ({path}). Corre la opcion 3 (Revisar) o 'check'.")
+        return
+    head, secs = read_log_sections(path)
+    if args.grep:
+        page_lines(grep_log(head, secs, args.grep))
+        return
+    if args.section:
+        i = pick_section(secs, args.section)
+        if i is None:
+            log(f"No encontre la seccion '{args.section}'. Secciones: " + "; ".join(f"{n}) {short_title(t, 40)}" for n, (t, _b) in enumerate(secs, 1)))
+            return
+        page_lines([f"=== {secs[i][0]} ==="] + secs[i][1])
+        return
+
+    def resumen():
+        print("\n".join(l for l in head if l.strip()))
+        print("\nSecciones:")
+        for n, (t, b) in enumerate(secs, 1):
+            print(f" {n:>2}) {short_title(t)}   [{len(b)} lineas]")
+    resumen()
+    if not (sys.stdin and sys.stdin.isatty()):
+        return
+    while True:
+        try:
+            op = input("\nNumero de seccion | /texto para buscar | r resumen | 0 volver: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if op in ("0", "q", ""):
+            if op == "":
+                continue
+            return
+        if op.lower() == "r":
+            resumen()
+        elif op.startswith("/") and len(op) > 1:
+            page_lines(grep_log(head, secs, op[1:].strip()))
+        else:
+            i = pick_section(secs, op)
+            if i is None:
+                print("Opcion no valida.")
+            else:
+                page_lines([f"=== {secs[i][0]} ==="] + secs[i][1])
+
+
 def cmd_organize(root, args):
     mode = args.mode
     scan_dirs = list(args.scan or DEFAULT_SCAN)
@@ -2213,6 +2337,8 @@ def run_action(act, root, args):
         cmd_organize(root, args)
         log("\n##### 3/3  REVISAR Y COPIAR ROMS #####")
         cmd_check(root, args, copy=True)
+    elif act == "log":
+        cmd_log(root, args)
     elif act == "github":
         cmd_github(root, args)
     elif act == "github-lists":
@@ -2224,7 +2350,7 @@ def run_action(act, root, args):
     return failed
 
 
-ACCIONES = ["update", "organize", "check", "copy", "rebuild", "rescan", "all", "github", "github-lists",
+ACCIONES = ["update", "organize", "check", "copy", "rebuild", "rescan", "all", "log", "github", "github-lists",
             "undo-organize", "undo-rebuild"]
 MENU_ITEMS = [
     ("1", "update", "Actualizar               (descarga las DBs de jd_update.list)"),
@@ -2236,6 +2362,7 @@ MENU_ITEMS = [
     ("7", "all", "TODO: 1 + 2 + 4"),
     ("8", "undo-organize", "Deshacer el organizador"),
     ("9", "undo-rebuild", "Deshacer los zips creados por la opcion 5"),
+    ("v", "log", "Ver el log (JD_Check.log) aqui: secciones, busqueda"),
     ("g", "github", "Actualizar el script y las listas desde GitHub"),
     ("l", "github-lists", "Actualizar solo las listas (jd_update.list, jd_exclude.list) desde GitHub"),
 ]
@@ -2317,6 +2444,8 @@ def main():
     ap.add_argument("--cores-dir", default=DEFAULT_CORES_DIR, help=f"carpeta de los .rbf (def. {DEFAULT_CORES_DIR})")
     ap.add_argument("--source", default=SOURCE_DIR, help="carpeta fuente de ROMs merged (def. la fija del script)")
     ap.add_argument("--rescan", action="store_true", help="regenerar jd_roms.db antes de copiar")
+    ap.add_argument("--section", metavar="N|TEXTO", help="log: mostrar una seccion (numero o parte del titulo)")
+    ap.add_argument("--grep", metavar="TEXTO", help="log: buscar texto en el log (sin distinguir mayusculas)")
     ap.add_argument("--gh-repo", default=GITHUB_REPO, help=f"github: repositorio (def. {GITHUB_REPO}) o carpeta local")
     ap.add_argument("--gh-branch", default=GITHUB_BRANCH, help=f"github: rama (def. {GITHUB_BRANCH})")
     ap.add_argument("--gh-path", default=GITHUB_PATH, help=f"github: carpeta del repo (def. {GITHUB_PATH})")
