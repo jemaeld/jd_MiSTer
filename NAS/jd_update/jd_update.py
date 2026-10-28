@@ -2,8 +2,8 @@
 """
 jd_update.py - Todo en uno para tu MiSTer_NEO: actualizar, organizar MRA, revisar y copiar ROMs.
 
-Puede vivir en la RAIZ (donde estan _Arcade y games) o en una subcarpeta de ella (MiSTer_NEO/jd_update/):
-detecta la raiz solo. Sus listas, caches, jd_roms.db y logs quedan junto al script.
+Puede vivir en la RAIZ (donde estan _Arcade y games) o en una subcarpeta de ella llamada jd_update
+(MiSTer_NEO/jd_update/): en ese caso la raiz es la carpeta padre. Sus listas, caches, jd_roms.db y logs quedan junto al script.
 Esta pensado para correr en el NAS por SSH.
 Sin argumentos abre un MENU numerado. Tambien se puede usar directo (cron, scripts):
 
@@ -2189,6 +2189,10 @@ def run_action(act, root, args):
     """Ejecuta una accion. Devuelve el numero de fallos (para el codigo de salida)."""
     failed = 0
     log(f"Raiz: {root}" + ("   [DRY-RUN]" if args.dry_run else ""))
+    if act in ("update", "organize", "all") and not any((root / m).is_dir() for m in ("_Arcade", "games")):
+        if not confirm(f"[!] {root} no tiene _Arcade ni games. Se crearia todo desde cero ahi. "
+                       "Es la raiz correcta (instalacion nueva)?", args, strict=True):
+            sys.exit("Cancelado. Si la raiz es otra, usa --root /ruta/a/MiSTer_NEO")
     if act == "update":
         failed = run_update(args, root)["failed"]
     elif act == "organize":
@@ -2277,8 +2281,11 @@ def menu(root, args):
 
 
 def detect_root():
-    """Raiz de MiSTer: la carpeta del script si ahi estan _Arcade/games; si no, su carpeta padre
-    (script en MiSTer_NEO/jd_update/)."""
+    """Raiz de MiSTer (donde estan _Arcade y games).
+    - Si el script vive en una carpeta llamada 'jd_update', la raiz es SU CARPETA PADRE (siempre).
+    - Si no: su propia carpeta si ya tiene _Arcade/games; si no, la padre si los tiene; si no, su carpeta."""
+    if BASE_DIR.name.lower() == "jd_update":
+        return BASE_DIR.parent
     for d in (BASE_DIR, BASE_DIR.parent):
         if (d / "_Arcade").is_dir() or (d / "games").is_dir():
             return d
