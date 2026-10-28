@@ -1,0 +1,103 @@
+[MiSTer]
+file_checking = 'exhaustive'
+
+[jtcores]
+db_url = https://raw.githubusercontent.com/jotego/jtcores_mister/main/jtbindb.json.zip
+filter = [MiSTer]
+
+[theypsilon_unofficial_distribution]
+db_url = https://raw.githubusercontent.com/theypsilon/Distribution_Unofficial_MiSTer/main/unofficialdb.json.zip
+
+[arcade_offset_folder]
+db_url = https://raw.githubusercontent.com/Toryalai1/Arcade_Offset/db/arcadeoffsetdb.json.zip
+
+[Coin-OpCollection/Distribution-MiSTerFPGA]
+db_url = https://raw.githubusercontent.com/Coin-OpCollection/Distribution-MiSTerFPGA/db/db.json.zip
+
+[ajgowans/alt-cores]
+db_url = https://raw.githubusercontent.com/ajgowans/alt-cores/db/db.json.zip
+
+[MiSTerOrganize/MiSTer_Frontier]
+db_url = https://raw.githubusercontent.com/MiSTerOrganize/MiSTer_Frontier/db/db.json.zip
+
+[agg23_db]
+db_url = https://raw.githubusercontent.com/agg23/mister-repository/db/manifest.json
+
+[MultiDatabases/collection-launcher]
+db_url = https://raw.githubusercontent.com/theypsilon/MultiDatabases_MiSTer/db/collection-launcher/db.json
+
+[funkycochise/Insert-Coin]
+db_url = https://raw.githubusercontent.com/funkycochise/Insert-Coin/db/db.json.zip
+
+[unstable_nightlies_folder]
+db_url = https://raw.githubusercontent.com/MiSTer-unstable-nightlies/Unstable_Folder_MiSTer/main/db_unstable_nightlies_folder.json
+
+[TheJesusFish/Blackwine-Segasystem1-2_Mister]
+db_url = https://raw.githubusercontent.com/TheJesusFish/Blackwine-SegaSystem1-2_MiSTer/db/db.json.zip
+
+[jlrh/jlrh-misterfpga-db]
+db_url = https://raw.githubusercontent.com/jlrh/jlrh-misterfpga-db/db/db.json.zip
+filter = !arcade-opwolf !arcade-thoop !arcade-ssriders
+
+[searchsolved/hyperduel]
+db_url = https://raw.githubusercontent.com/searchsolved/Arcade_HyperDuel_MiSTer/main/hyperduel_db.json
+
+[TheJesusFish/Slop-Core]
+db_url = https://raw.githubusercontent.com/TheJesusFish/Slop-Core/db/db.json.zip
+
+[meathax/meatcores]
+db_url = https://raw.githubusercontent.com/meathax/meatcores/db/db.json.zip
+
+[rossops/Arcade-SegaXBoard_MiSTer]
+db_url = https://raw.githubusercontent.com/rossops/Arcade-SegaXBoard_MiSTer/main/db.json.zip
+
+[asturur/Mister-cores]
+db_url = https://raw.githubusercontent.com/asturur/Mister-cores/db/db.json.zip
+
+[TomSVR-Mister/TomSVR-Arcade-Cores]
+db_url = https://raw.githubusercontent.com/TomSVR-Mister/TomSVR-Arcade-Cores/db/db.json.zip
+
+[MultiDatabases/solarus]
+db_url = https://raw.githubusercontent.com/theypsilon/MultiDatabases_MiSTer/db/solarus/db.json
+
+[MultiDatabases/sonic-mania]
+db_url = https://raw.githubusercontent.com/theypsilon/MultiDatabases_MiSTer/db/sonic-mania/db.json
+
+[MultiDatabases/cifs-scripts]
+db_url = https://raw.githubusercontent.com/theypsilon/MultiDatabases_MiSTer/db/cifs-scripts/db.json
+
+[update_all_mister]
+db_url = https://raw.githubusercontent.com/theypsilon/Update_All_MiSTer/db/update_all_db.json
+
+[OngoGablogian/MiSTer_Ongo]
+db_url = https://raw.githubusercontent.com/OngoGablogian/MiSTer_Ongo/db/db.json.zip
+
+[shmupfan]
+db_url = https://raw.githubusercontent.com/shmupfan/Distribution/main/db.json
+
+[ppriest/MiSTer_ppriest]
+db_url = https://raw.githubusercontent.com/ppriest/MiSTer_ppriest/db/db.json.zip
+
+[decoryah/MiSTer_decoryah]
+db_url = https://raw.githubusercontent.com/decoryah/MiSTer_decoryah/db/db.json.zip
+
+[kuzearcade/kuzecores]
+db_url = https://raw.githubusercontent.com/kuzearcade/kuzecores/db/db.json.zip
+
+[blahm1d]
+db_url = https://mister.blahm1d.com/db.json.zip
+
+[bazset/MiSTer_BAZSET]
+db_url = https://raw.githubusercontent.com/bazset/MiSTer_BAZSET/db/db.json.zip
+
+[Gm0rk/Gm0rkCores]
+db_url = https://raw.githubusercontent.com/Gm0rk/Gm0rkCores/db/db.json.zip
+
+[rmonic79/rmcores]
+db_url = https://raw.githubusercontent.com/rmonic79/rmcores/db/db.json.zip
+
+[rossops/Arcade-SegaYBoard_MiSTer]
+db_url = https://raw.githubusercontent.com/rossops/Arcade-SegaYBoard_MiSTer/main/db.json.zip
+
+[decoryah/MiSTer_decoryah]
+db_url = https://raw.githubusercontent.com/decoryah/MiSTer_decoryah/db/db.json.zip

@@ -35,6 +35,22 @@ La carpeta `_Arcade/@JD_Extras/` se instala en `/media/fat/_Arcade/@JD_Extras/` 
 
 Estos MRAs necesitan que tengas en `games/mame` los `.zip` de ROM correspondientes y el core indicado en cada MRA. Los scripts solo revisan `_Arcade` (no sus subcarpetas), así que `missingRFB.sh` y `missingarcaderoms.sh` no analizan esta carpeta.
 
+## NAS: jd_update
+
+`NAS/jd_update/` tiene mi gestor de ROMs y MRA, pensado para correr por SSH en el NAS (Python 3.8+, sin dependencias). No es un script del MiSTer: vive en la carpeta `jd_update/` dentro de la raíz de MiSTer (donde están `_Arcade` y `games`).
+
+```
+python3 jd_update.py          # menú numerado
+python3 jd_update.py all      # actualizar + organizar + revisar y copiar ROMs
+```
+
+- **Actualizar:** descarga las DBs de `jd_update.list` (solo lo que falta o cambió, con MD5).
+- **Organizar:** crea en `_@JD_Organizer` enlaces simbólicos: `_CORE` (por core), `_DEBUT`, `_PAST DEBUT`, `_UPDATED`, `_PAST UPDATED` y `_A-Z`. Una MRA cuenta como actualizada si cambió ella o el `.rbf` de su core.
+- **Revisar:** replica el cargador del MiSTer, así que una MRA solo es problema si de verdad no cargaría (los sets merged no cuentan como faltantes). Escribe `JD_Check.log`.
+- **Copiar:** copia desde la carpeta de ROMs MAME merged del NAS los zips que las MRA necesitan, usando un índice en texto plano (`jd_roms.db`, se regenera con `rescan`).
+
+Ajusta `SOURCE_DIR` al inicio del script con la ruta de tus ROMs.
+
 ## Configuración
 
 `Backups/MiSTer.ini` es mi `MiSTer.ini` (salida HDMI a 2560x1440, HDR, integer scale y el `main` de Zaparoo). Se guarda aquí como respaldo y no en la raíz a propósito: así Downloader no sobrescribe el `MiSTer.ini` activo en `/media/fat/`. Para usarlo, cópialo a `/media/fat/MiSTer.ini`.
