@@ -15,6 +15,8 @@ Sin argumentos abre un MENU numerado. Tambien se puede usar directo (cron, scrip
     python3 jd_update.py rebuild         # check + crea zips "solucionables" a partir de tus zips
     python3 jd_update.py rescan          # regenera jd_roms.db (indice de la fuente)
     python3 jd_update.py all             # update + organize + copy
+    python3 jd_update.py github          # trae de GitHub el script y las listas (jd_update.list, jd_exclude.list)
+    python3 jd_update.py github-lists    # igual, pero solo las listas
     python3 jd_update.py undo-organize   # quita lo que creo el organizador
     python3 jd_update.py undo-rebuild    # borra los zips que creo rebuild
 
@@ -39,6 +41,7 @@ Solo usa la libreria estandar de Python 3.8+.
 """
 import argparse
 import configparser
+import difflib
 import fnmatch
 import hashlib
 import io
@@ -82,6 +85,9 @@ CACHE_FILE = "JD_Check.cache.json"
 REBUILT_FILE = "JD_Check_rebuilt.json"
 EXCLUDE_FILE = "jd_exclude.list"
 MOVES_FILE = "JD_Organizer_moves.json"
+GITHUB_REPO = "jemaeld/jd_MiSTer"           # de donde se bajan las listas (y el script) con 'github'
+GITHUB_BRANCH = "main"
+GITHUB_PATH = "NAS/jd_update"
 HISTORY_FILE = "JD_Update_history.json"   # que MRA bajo cada update (nuevas / actualizadas)
 CORE_DIR = "_CORE"                         # dentro de _@JD_Organizer: aqui van las carpetas por core
 SPECIAL_DIRS = ["_DEBUT", "_PAST DEBUT", "_UPDATED", "_PAST UPDATED", "_A-Z"]  # dentro de _@JD_Organizer
@@ -2004,6 +2010,122 @@ def clear_special(org):
                 pass
 
 
+# =====================================================================
+#  ACTUALIZAR EL SCRIPT Y LAS LISTAS DESDE GITHUB
+# =====================================================================
+_RESTART = False
+
+
+def gh_fetch(repo, branch, path, name):
+    """Contenido de <path>/<name> en GitHub (raw). `repo` puede ser tambien una carpeta local (un clon).
+    None si no existe."""
+    if os.path.isdir(repo):
+        f = Path(repo) / path / name
+        return f.read_bytes() if f.is_file() else None
+    url = f"https://raw.githubusercontent.com/{repo}/{branch}/{path.strip('/')}/{quote(name)}"
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Cache-Control": "no-cache"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.read()
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+
+
+def list_sections(data):
+    cp = configparser.ConfigParser(strict=False, interpolation=None)
+    cp.optionxform = str
+    try:
+        cp.read_string(data.decode("utf-8-sig", errors="replace"))
+        return set(cp.sections())
+    except configparser.Error:
+        return set()
+
+
+def diff_summary(name, cur, remote):
+    if cur is None:
+        return "archivo nuevo"
+    a = cur.decode("utf-8", errors="replace").splitlines()
+    b = remote.decode("utf-8", errors="replace").splitlines()
+    add = rem = 0
+    for ln in difflib.unified_diff(a, b, lineterm="", n=0):
+        if ln.startswith("+") and not ln.startswith("+++"):
+            add += 1
+        elif ln.startswith("-") and not ln.startswith("---"):
+            rem += 1
+    txt = f"+{add} / -{rem} lineas"
+    if name.endswith(".list") and name != EXCLUDE_FILE:
+        s1, s2 = list_sections(cur), list_sections(remote)
+        if s2 - s1:
+            txt += " | DBs nuevas: " + ", ".join(sorted(s2 - s1)[:8]) + ("..." if len(s2 - s1) > 8 else "")
+        if s1 - s2:
+            txt += " | DBs que se quitan: " + ", ".join(sorted(s1 - s2)[:8]) + ("..." if len(s1 - s2) > 8 else "")
+    return txt
+
+
+def cmd_github(root, args, only_lists=False):
+    """Trae de GitHub jd_update.list, jd_exclude.list y (si no only_lists) el propio script.
+    Guarda copia .bak de lo que reemplaza. El script nuevo se valida antes de instalarlo."""
+    global _RESTART
+    repo, branch, path = args.gh_repo, args.gh_branch, args.gh_path
+    log(f"Fuente: {repo if os.path.isdir(repo) else f'github.com/{repo}'}"
+        f"{'' if os.path.isdir(repo) else f' ({branch})'} / {path}")
+    ini = find_default_ini(root) or (STATE_DIR / "jd_update.list")
+    targets = [("jd_update.list", ini), (EXCLUDE_FILE, STATE_DIR / EXCLUDE_FILE)]
+    if not only_lists:
+        targets.append(("jd_update.py", Path(__file__).resolve()))
+    changed = 0
+    for name, local in targets:
+        try:
+            remote = gh_fetch(repo, branch, path, name)
+        except Exception as e:  # noqa
+            log(f"  [ERROR] {name}: no pude bajarlo ({e})")
+            continue
+        if remote is None:
+            log(f"  {name}: no esta en el repositorio, se deja el local")
+            continue
+        cur = local.read_bytes() if local.is_file() else None
+        if cur is not None and cur.replace(b"\r\n", b"\n") == remote.replace(b"\r\n", b"\n"):
+            log(f"  {name}: ya esta al dia")
+            continue
+        if name.endswith(".py"):
+            try:
+                compile(remote, name, "exec")
+                if b"def main(" not in remote:
+                    raise SyntaxError("no parece el script completo")
+            except SyntaxError as e:
+                log(f"  [ERROR] {name}: la version de GitHub no es valida ({e}); no se instala")
+                continue
+        log(f"  {name}: HAY CAMBIOS ({diff_summary(name, cur, remote)})")
+        if args.dry_run:
+            continue
+        if not confirm(f"  Reemplazar {local.name}? (copia en {local.name}.bak)", args):
+            log("  omitido")
+            continue
+        try:
+            if cur is not None:
+                shutil.copy2(local, local.with_name(local.name + ".bak"))
+            tmp = local.with_name(local.name + ".new")
+            tmp.write_bytes(remote)
+            if local.is_file():
+                shutil.copymode(local, tmp)
+            os.replace(tmp, local)
+        except OSError as e:
+            log(f"  [ERROR] {name}: no pude escribirlo ({e})")
+            continue
+        changed += 1
+        log(f"  {name}: actualizado")
+        if name.endswith(".py"):
+            _RESTART = True
+    if args.dry_run:
+        log("(dry-run: no se cambio nada)")
+    elif not changed:
+        log("Nada que actualizar.")
+    if _RESTART:
+        log("El script se actualizo: vuelve a ejecutarlo para usar la version nueva.")
+
+
 def cmd_organize(root, args):
     mode = args.mode
     scan_dirs = list(args.scan or DEFAULT_SCAN)
@@ -2086,6 +2208,10 @@ def run_action(act, root, args):
         cmd_organize(root, args)
         log("\n##### 3/3  REVISAR Y COPIAR ROMS #####")
         cmd_check(root, args, copy=True)
+    elif act == "github":
+        cmd_github(root, args)
+    elif act == "github-lists":
+        cmd_github(root, args, only_lists=True)
     elif act == "undo-organize":
         undo(root)
     elif act == "undo-rebuild":
@@ -2093,7 +2219,8 @@ def run_action(act, root, args):
     return failed
 
 
-ACCIONES = ["update", "organize", "check", "copy", "rebuild", "rescan", "all", "undo-organize", "undo-rebuild"]
+ACCIONES = ["update", "organize", "check", "copy", "rebuild", "rescan", "all", "github", "github-lists",
+            "undo-organize", "undo-rebuild"]
 MENU_ITEMS = [
     ("1", "update", "Actualizar               (descarga las DBs de jd_update.list)"),
     ("2", "organize", "Organizar MRA            (_CORE, _A-Z, _DEBUT, _UPDATED...)"),
@@ -2104,6 +2231,8 @@ MENU_ITEMS = [
     ("7", "all", "TODO: 1 + 2 + 4"),
     ("8", "undo-organize", "Deshacer el organizador"),
     ("9", "undo-rebuild", "Deshacer los zips creados por la opcion 5"),
+    ("g", "github", "Actualizar el script y las listas desde GitHub"),
+    ("l", "github-lists", "Actualizar solo las listas (jd_update.list, jd_exclude.list) desde GitHub"),
 ]
 
 
@@ -2137,6 +2266,9 @@ def menu(root, args):
                 log(str(e.code))
         except KeyboardInterrupt:
             log("\nInterrumpido.")
+        if _RESTART:
+            print("\nEl script se actualizo: vuelve a ejecutarlo para usar la version nueva.")
+            return
         try:
             input("\nEnter para volver al menu...")
         except (EOFError, KeyboardInterrupt):
@@ -2177,6 +2309,9 @@ def main():
     ap.add_argument("--cores-dir", default=DEFAULT_CORES_DIR, help=f"carpeta de los .rbf (def. {DEFAULT_CORES_DIR})")
     ap.add_argument("--source", default=SOURCE_DIR, help="carpeta fuente de ROMs merged (def. la fija del script)")
     ap.add_argument("--rescan", action="store_true", help="regenerar jd_roms.db antes de copiar")
+    ap.add_argument("--gh-repo", default=GITHUB_REPO, help=f"github: repositorio (def. {GITHUB_REPO}) o carpeta local")
+    ap.add_argument("--gh-branch", default=GITHUB_BRANCH, help=f"github: rama (def. {GITHUB_BRANCH})")
+    ap.add_argument("--gh-path", default=GITHUB_PATH, help=f"github: carpeta del repo (def. {GITHUB_PATH})")
     ap.add_argument("--exclude", action="append", default=[], metavar="ZIP", help=f"zip a ignorar (ademas de {EXCLUDE_FILE})")
     ap.add_argument("--no-cache", action="store_true", help=f"no usar {CACHE_FILE}")
     ap.add_argument("--log", default=CHECK_LOG, help=f"nombre del log de revision (def. {CHECK_LOG})")

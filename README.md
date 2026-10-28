@@ -51,6 +51,8 @@ python3 jd_update.py all      # actualizar + organizar + revisar y copiar ROMs
 
 Ajusta `SOURCE_DIR` al inicio del script con la ruta de tus ROMs.
 
+Para traer de aquí el script y las listas (`jd_update.list`, `jd_exclude.list`) a tu NAS: opción `g` del menú, o `python3 jd_update.py github` (`github-lists` solo trae las listas). Muestra qué cambia, pide confirmación y guarda copia `.bak`.
+
 ## Configuración
 
 `Backups/MiSTer.ini` es mi `MiSTer.ini` (salida HDMI a 2560x1440, HDR, integer scale y el `main` de Zaparoo). Se guarda aquí como respaldo y no en la raíz a propósito: así Downloader no sobrescribe el `MiSTer.ini` activo en `/media/fat/`. Para usarlo, cópialo a `/media/fat/MiSTer.ini`.
