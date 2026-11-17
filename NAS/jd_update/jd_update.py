@@ -1019,6 +1019,7 @@ RE_SET = re.compile(r"<setname>\s*(.*?)\s*</setname>", re.I | re.S)
 RE_ROM = re.compile(r"<rom\b([^>]*?)(?:/>|>(.*?)</rom>)", re.I | re.S)
 RE_PART = re.compile(r"<part\b([^>]*?)/?>", re.I)
 RE_FILE = re.compile(r"<file\b([^>]*?)/?>", re.I)
+RE_DISKWORD = re.compile(r"(?<![\w.\-])([\w][\w.\-]*\.(?:chd|hdd|img))(?![\w])", re.I)
 RE_DATED = re.compile(r"_(\d{6,8}[a-z]?)$", re.I)
 # ------------------------------------------------------------- PARSEO ----
 def attr(attrs, key):
@@ -1033,7 +1034,13 @@ def split_zips(value):
 def parse_mra(raw):
     """-> dict(rbf, setname, zips[], roms[{index, zips[], parts[{name, crc, zips[]}]}], files[{root, path, index}]).
     Regex a proposito: varias MRA no son XML valido."""
-    text = RE_COMMENT.sub("", raw.decode("utf-8", errors="replace"))  # los comentarios pueden nombrar tags
+    full = raw.decode("utf-8", errors="replace")
+    cdisks = []
+    for cm in RE_COMMENT.findall(full):            # discos que la MRA solo menciona en comentarios (ranuras del OSD)
+        for w in RE_DISKWORD.findall(cm):
+            if w.lower() not in [x.lower() for x in cdisks]:
+                cdisks.append(w)
+    text = RE_COMMENT.sub("", full)  # los comentarios pueden nombrar tags
     m = RE_RBF.search(text)
     rbf = m.group(1) if m else ""
     m = RE_SET.search(text)
@@ -1075,7 +1082,7 @@ def parse_mra(raw):
         fp = attr(fa, "path")
         if fp:
             files.append({"root": attr(fa, "root"), "path": fp.strip(), "index": attr(fa, "index")})
-    return {"rbf": rbf, "setname": setname, "zips": zips, "roms": roms, "files": files}
+    return {"rbf": rbf, "setname": setname, "zips": zips, "roms": roms, "files": files, "cdisks": cdisks}
 
 
 def load_excludes(root, extra=()):
@@ -2663,7 +2670,7 @@ def mra_disks(e):
 
 
 def collect_disks(root, entries):
-    """Agrupa por archivo de destino. -> {clave en minusculas: dict(parts, rel, stem, ext, mras[], rbfs{}, cands[])}"""
+    """Discos con <file> (destino fijo), agrupados por archivo de destino."""
     disks = {}
     for e in entries:
         for parts in mra_disks(e):
@@ -2677,10 +2684,37 @@ def collect_disks(root, entries):
             if e["rbf"].strip():
                 d["rbfs"].add(rbf_basename(e["rbf"]))
             # el CHD puede llamarse como el disco o como el set padre (zip) de la MRA
-            for c in [d["stem"]] + [os.path.splitext(z)[0] for z in e["zips"]]:
+            for c in [d["stem"]] + set_names(e):
                 if c and c.lower() not in [x.lower() for x in d["cands"]]:
                     d["cands"].append(c)
     return disks
+
+
+def set_names(e):
+    """Nombres de set de una MRA: setname y zips (padre/clon), sin .zip y sin carpeta."""
+    out = []
+    for n in ([e.get("setname", "")] + [os.path.splitext(z.replace("\\", "/").split("/")[-1])[0] for z in e["zips"]]):
+        if n and n.lower() not in [x.lower() for x in out]:
+            out.append(n)
+    return out
+
+
+def local_disk_search(root, name, sets, rbfs):
+    """Busca un archivo de disco ya presente: games/<carpeta>/<name> o games/<carpeta>/<set>/<name>."""
+    gdir = root / "games"
+    try:
+        subs = os.listdir(gdir)
+    except OSError:
+        return None
+    for sub in subs:
+        base = gdir / sub
+        if not base.is_dir():
+            continue
+        for mid in [[]] + [[c] for c in sets]:
+            p = find_ci(gdir, [sub] + mid + [name])
+            if p is not None and p.is_file() and p.stat().st_size > 0:
+                return p
+    return None
 
 
 def find_local_chd(root, d):
@@ -2695,98 +2729,197 @@ def find_local_chd(root, d):
     return None
 
 
+def pick_torrent_row(rows, prefer):
+    """De varias coincidencias elige la que esta en la carpeta de un set preferido."""
+    pl = [x.lower() for x in prefer]
+    return sorted(rows, key=lambda tf: (tf[1]["path"].split("/")[-2:-1] or [""])[0].lower() not in pl)[0]
+
+
 def cmd_disks(root, args):
-    """Revisa que discos (.hdd/.img/.chd) piden las MRA, cuales faltan en games/ y de donde saldrian.
-    Solo lee: no descarga ni convierte. Escribe JD_Discos.log y JD_Discos.json."""
+    """Que discos (CHD / .hdd / .img) necesitan las MRA y de donde saldrian. Solo lee: no descarga ni convierte.
+    Tres origenes, de mas a menos seguro:
+      FIJO     la MRA trae <file ... .hdd/.img/.chd> (destino exacto en games/)
+      OSD      la MRA solo nombra el disco en un comentario (el core lo pide por las ranuras del OSD)
+      POSIBLE  el set de MAME tiene CHD en el torrent pero la MRA no lo menciona (revisar a mano)
+    Escribe JD_Discos.log y JD_Discos.json."""
     _ls_cache.clear()
     problems = []
     entries = scan_mras(root, list(args.scan or CHECK_SCAN), problems)
     if not entries:
         sys.exit(f"No encontre ninguna .mra en: {', '.join(args.scan or CHECK_SCAN)}")
-    disks = collect_disks(root, entries)
-    log(f"MRAs unicas: {len(entries)} | discos distintos que piden: {len(disks)}")
-    if not disks:
-        log("Ninguna MRA pide discos (<file ... .hdd/.img/.chd>).")
-        return
     tdir = STATE_DIR / TORRENTS_DIR
     torrents, tidx, terrors = index_torrents(tdir)
+    disks = collect_disks(root, entries)
+    fixed_stems = {d["stem"].lower() for d in disks.values()}
     items = []
+
+    def tor_row(name, prefer):
+        rows = tidx.get(name.lower(), [])
+        return pick_torrent_row(rows, prefer) if rows else None
+
+    # ---- FIJO ----
     for key in sorted(disks):
         d = disks[key]
         dest = find_ci(root, d["parts"])
-        it = {"dest": d["rel"], "core_dir": "/".join(d["parts"][:2]) if len(d["parts"]) > 2 else "/".join(d["parts"][:-1]),
-              "ext": d["ext"], "rbfs": sorted(d["rbfs"]), "mras": d["mras"], "chd_name": None, "chd_local": None,
-              "torrent": None, "size": 0, "exists": False}
+        it = {"kind": "FIJO", "dest": d["rel"], "name": d["parts"][-1], "ext": d["ext"], "rbfs": sorted(d["rbfs"]),
+              "mras": d["mras"], "chd_name": None, "chd_local": None, "torrent": None, "size": 0,
+              "group": "/".join(d["parts"][:2]) if len(d["parts"]) > 2 else "/".join(d["parts"][:-1])}
         if dest is not None and dest.is_file() and dest.stat().st_size > 0:
-            it["exists"] = True
             it["size"] = dest.stat().st_size
             it["status"] = "OK"
         else:
             it["convert"] = d["ext"] != ".chd"
             local = find_local_chd(root, d)
             if local is not None:
-                it["chd_local"] = rel(root, local)
-                it["chd_name"] = local.name
-                it["status"] = "CONVERTIR" if it["convert"] else "COPIAR"
+                it.update(chd_local=rel(root, local), chd_name=local.name,
+                          status="CONVERTIR" if it["convert"] else "COPIAR")
             else:
                 hit = None
                 for c in d["cands"]:
-                    rows = tidx.get(c.lower() + ".chd", [])
-                    rows = sorted(rows, key=lambda tf: tf[1]["path"].split("/")[-2:-1] != [c])  # prefiere carpeta del juego
-                    if rows:
-                        hit = (c, rows[0])
+                    r = tor_row(c + ".chd", d["cands"])
+                    if r:
+                        hit = (c, r)
                         break
                 if hit:
                     c, (t, f) = hit
-                    it["chd_name"] = c + ".chd"
-                    it["torrent"] = {"file": t["file"], "path": f["path"], "size": f["size"], "index": f["index"]}
-                    it["size"] = f["size"]
-                    it["status"] = "BAJAR"
+                    it.update(chd_name=c + ".chd", status="BAJAR", size=f["size"],
+                              torrent={"file": t["file"], "path": f["path"], "size": f["size"], "index": f["index"]})
                 else:
                     it["chd_name"] = d["cands"][0] + ".chd" if d["cands"] else None
                     it["status"] = "SIN FUENTE" if torrents else "SIN TORRENT CARGADO"
         items.append(it)
 
-    order = {"OK": 5, "COPIAR": 1, "CONVERTIR": 1, "BAJAR": 2, "SIN FUENTE": 0, "SIN TORRENT CARGADO": 0}
+    # ---- OSD: nombres citados en comentarios ----
+    osd = {}
+    for e in entries:
+        for w in e.get("cdisks", []):
+            stem = os.path.splitext(w)[0]
+            if stem.lower() in fixed_stems:
+                continue
+            o = osd.setdefault(w.lower(), {"name": w, "stem": stem, "mras": [], "rbfs": set(), "sets": []})
+            o["mras"].append(rel(root, e["path"]))
+            if e["rbf"].strip():
+                o["rbfs"].add(rbf_basename(e["rbf"]))
+            for c in set_names(e):
+                if c.lower() not in [x.lower() for x in o["sets"]]:
+                    o["sets"].append(c)
+    for k in sorted(osd):
+        o = osd[k]
+        chd = o["stem"] + ".chd"
+        it = {"kind": "OSD", "dest": None, "name": o["name"], "ext": os.path.splitext(o["name"])[1].lower(),
+              "rbfs": sorted(o["rbfs"]), "mras": o["mras"], "chd_name": chd, "chd_local": None, "torrent": None,
+              "size": 0, "group": ", ".join(sorted(o["rbfs"])) or "?"}
+        loc = local_disk_search(root, o["name"], o["sets"], o["rbfs"]) or (
+            local_disk_search(root, chd, o["sets"], o["rbfs"]) if chd.lower() != o["name"].lower() else None)
+        if loc is not None:
+            it.update(chd_local=rel(root, loc), status="LOCAL", size=loc.stat().st_size)
+        else:
+            r = tor_row(chd, o["sets"])
+            if r:
+                t, f = r
+                it.update(status="BAJAR", size=f["size"],
+                          torrent={"file": t["file"], "path": f["path"], "size": f["size"], "index": f["index"]})
+            else:
+                it["status"] = "SIN FUENTE" if torrents else "SIN TORRENT CARGADO"
+        items.append(it)
+
+    # ---- POSIBLE: CHD del set de MAME que la MRA no menciona ----
+    covered = {it["torrent"]["path"] for it in items if it["torrent"]}
+    folders = defaultdict(list)                       # carpeta del juego (minusculas) -> [(torrent, archivo)]
+    for t in torrents:
+        for f in t["files"]:
+            if f["path"].lower().endswith(".chd") and "/" in f["path"]:
+                parts = f["path"].split("/")
+                if len(parts) >= 3:
+                    folders[parts[-2].lower()].append((t, f))
+    named = {it["name"].lower() for it in items} | {(it["chd_name"] or "").lower() for it in items}
+    poss = {}
+    for e in entries:
+        if mra_disks(e) or any(os.path.splitext(w)[0].lower() in fixed_stems or w.lower() in named for w in e.get("cdisks", [])):
+            continue
+        for c in set_names(e):
+            for t, f in folders.get(c.lower(), []):
+                if f["path"] in covered:
+                    continue
+                g = poss.setdefault(c.lower(), {"set": c, "files": {}, "mras": [], "rbfs": set()})
+                g["files"][f["path"]] = (t, f)
+                if rel(root, e["path"]) not in g["mras"]:
+                    g["mras"].append(rel(root, e["path"]))
+                if e["rbf"].strip():
+                    g["rbfs"].add(rbf_basename(e["rbf"]))
+    for k in sorted(poss):
+        g = poss[k]
+        fl = list(g["files"].values())
+        items.append({"kind": "POSIBLE", "dest": None, "name": g["set"], "ext": ".chd", "rbfs": sorted(g["rbfs"]),
+                      "mras": g["mras"], "chd_name": ", ".join(f["path"].rsplit("/", 1)[-1] for _t, f in fl),
+                      "chd_local": None, "status": "POSIBLE", "size": sum(f["size"] for _t, f in fl),
+                      "torrent": {"file": fl[0][0]["file"], "path": fl[0][1]["path"], "size": sum(f["size"] for _t, f in fl),
+                                  "index": fl[0][1]["index"], "paths": [f["path"] for _t, f in fl]},
+                      "group": ", ".join(sorted(g["rbfs"])) or "?"})
+
+    nm = len(entries)
+    if not items:
+        log(f"MRAs unicas: {nm} | ninguna pide discos (ni <file>, ni comentario con .chd/.hdd/.img, ni set con CHD en los torrents).")
+        if not torrents:
+            log(f"Aviso: no hay .torrent en {tdir}; sin el de CHDs no se pueden detectar los sets con CHD.")
+        return
+
+    kinds = ("FIJO", "OSD", "POSIBLE")
+    desc = {"FIJO": "la MRA trae <file> con el destino exacto en games/",
+            "OSD": "la MRA solo nombra el disco en un comentario (ranura del OSD)",
+            "POSIBLE": "el set de MAME tiene CHD pero la MRA no lo menciona (revisar)"}
+    order = {"OK": 6, "LOCAL": 6, "COPIAR": 1, "CONVERTIR": 1, "BAJAR": 2, "POSIBLE": 3, "SIN FUENTE": 0, "SIN TORRENT CARGADO": 0}
     L = [f"===== DISCOS (HDD / IMG / CHD) =====   {datetime.now():%Y-%m-%d %H:%M:%S}",
-         f"Raiz: {root}", f"MRAs unicas: {len(entries)} | discos distintos: {len(items)}",
-         f"Torrents cargados: {len(torrents)} ({tdir})", ""]
-    cnt = Counter(i["status"] for i in items)
-    L.append("Resumen: " + " | ".join(f"{k}: {v}" for k, v in sorted(cnt.items(), key=lambda kv: order.get(kv[0], 9))))
-    by = defaultdict(list)
-    for i in items:
-        by[i["core_dir"]].append(i)
-    L += ["", "--- Por carpeta de core (games/<core>) ---"]
-    for cd in sorted(by):
-        c = Counter(i["status"] for i in by[cd])
-        L.append(f"  {cd:<28} " + ", ".join(f"{k} {v}" for k, v in sorted(c.items(), key=lambda kv: order.get(kv[0], 9))))
-    tb = {(i["torrent"]["file"], i["torrent"]["path"]): i["torrent"]["size"] for i in items if i["status"] == "BAJAR"}
-    if tb:
-        L += ["", f"A bajar de torrents: {len(tb)} CHD, {fmt_size(sum(tb.values()))}"]
-    n_head = len(L)
-    for st in ("SIN FUENTE", "SIN TORRENT CARGADO", "BAJAR", "CONVERTIR", "COPIAR", "OK"):
-        sel = [i for i in items if i["status"] == st]
+         f"Raiz: {root}", f"MRAs unicas: {nm}", f"Torrents cargados: {len(torrents)} ({tdir})", ""]
+    for kd in kinds:
+        sel = [i for i in items if i["kind"] == kd]
         if not sel:
             continue
-        L += ["", f"=== {st} ({len(sel)}) ==="]
-        for i in sel:
-            L.append(f"{i['dest']}   [core: {', '.join(i['rbfs']) or '?'}]")
-            L.append(f"    MRA: {i['mras'][0]}" + (f"  (+{len(i['mras']) - 1} mas)" if len(i["mras"]) > 1 else ""))
-            if st == "OK":
-                L.append(f"    tamano: {fmt_size(i['size'])}")
+        cnt = Counter(i["status"] for i in sel)
+        tb = {(i["torrent"]["file"], i["torrent"]["path"]): i["torrent"]["size"] for i in sel
+              if i["torrent"] and i["status"] in ("BAJAR", "POSIBLE")}
+        nmra = len({m for i in sel for m in i["mras"]})
+        L.append(f"{kd}: {len(sel)} ({nmra} MRA)  -  {desc[kd]}")
+        L.append("    " + " | ".join(f"{k}: {v}" for k, v in sorted(cnt.items(), key=lambda kv: order.get(kv[0], 9)))
+                 + (f"   -> a bajar de torrents: {fmt_size(sum(tb.values()))}" if tb else ""))
+    n_head = len(L)
+    L += ["", "--- Por carpeta de core / destino ---"]
+    byg = defaultdict(list)
+    for i in items:
+        byg[(i["kind"], i["group"])].append(i)
+    for (kd, g) in sorted(byg):
+        c = Counter(i["status"] for i in byg[(kd, g)])
+        L.append(f"  {kd:<8} {g:<30} " + ", ".join(f"{k} {v}" for k, v in sorted(c.items(), key=lambda kv: order.get(kv[0], 9))))
+    for kd in kinds:
+        for st in ("SIN FUENTE", "SIN TORRENT CARGADO", "BAJAR", "POSIBLE", "CONVERTIR", "COPIAR", "LOCAL", "OK"):
+            sel = [i for i in items if i["kind"] == kd and i["status"] == st]
+            if not sel:
                 continue
-            if i["chd_name"]:
-                L.append(f"    CHD de origen: {i['chd_name']}")
-            if i["chd_local"]:
-                L.append(f"    CHD ya local: {i['chd_local']}  -> falta " + ("convertir a " + i["ext"] if i["convert"] else "copiarlo"))
-            if i["torrent"]:
-                t = i["torrent"]
-                L.append(f"    torrent: [{t['file']}] {t['path']}  {fmt_size(t['size'])}  (indice {t['index']})")
-            if st.startswith("SIN"):
-                L.append("    (revisa el nombre con:  python3 jd_update.py torrents --find " + (i["chd_name"] or i["dest"]).rsplit(".", 1)[0] + ")")
+            L += ["", f"=== {kd}: {st} ({len(sel)}) ==="]
+            for i in sel:
+                if kd == "POSIBLE":
+                    L.append(f"set {i['name']}   [core: {', '.join(i['rbfs']) or '?'}]   {fmt_size(i['size'])}")
+                    L.append(f"    MRA: {i['mras'][0]}" + (f"  (+{len(i['mras']) - 1} mas)" if len(i["mras"]) > 1 else ""))
+                    for pth in i["torrent"]["paths"]:
+                        L.append(f"    CHD: {pth}")
+                    continue
+                L.append((i["dest"] or i["name"]) + f"   [core: {', '.join(i['rbfs']) or '?'}]")
+                L.append(f"    MRA: {i['mras'][0]}" + (f"  (+{len(i['mras']) - 1} mas)" if len(i["mras"]) > 1 else ""))
+                if st in ("OK", "LOCAL"):
+                    L.append(f"    {i['chd_local'] or i['dest']}  {fmt_size(i['size'])}")
+                    continue
+                if i["chd_name"]:
+                    L.append(f"    CHD de origen: {i['chd_name']}")
+                if i["chd_local"]:
+                    L.append(f"    CHD ya local: {i['chd_local']}  -> falta " + ("convertir a " + i["ext"] if i.get("convert") else "copiarlo"))
+                if i["torrent"]:
+                    t = i["torrent"]
+                    L.append(f"    torrent: [{t['file']}] {t['path']}  {fmt_size(t['size'])}  (indice {t['index']})")
+                if st.startswith("SIN"):
+                    L.append("    (busca el nombre con:  python3 jd_update.py torrents --find " + (i["chd_name"] or i["name"]).rsplit(".", 1)[0] + ")")
     try:
         (STATE_DIR / DISKS_LOG).write_text("\n".join(L) + "\n", encoding="utf-8")
-        (STATE_DIR / DISKS_JSON).write_text(json.dumps(items, indent=1, ensure_ascii=False), encoding="utf-8")
+        (STATE_DIR / DISKS_JSON).write_text(json.dumps(items, indent=1, ensure_ascii=False, default=list), encoding="utf-8")
     except OSError as ex:
         log(f"[!] no se pudo escribir el reporte: {ex}")
     for n, why in terrors:
@@ -2797,255 +2930,6 @@ def cmd_disks(root, args):
     if not torrents:
         log(f"Aviso: no hay .torrent en {tdir}; pon ahi el de MAME CHDs para saber cuales bajar.")
     log("(Solo revisa: todavia no descarga ni convierte.)")
-
-
-# ====================================================================
-#  MAGNETS -> .torrent (pide solo los METADATOS a tu Deluge; no descarga datos)
-# ====================================================================
-DELUGE_TEMPLATE = """[deluge]
-# URL del Web UI de Deluge (con o sin /json al final)
-url = {url}
-# contrasena del Web UI
-password = {password}
-# solo si tu Web UI esta detras de usuario/contrasena HTTP (basic auth); si no, dejalos vacios
-http_user =
-http_pass =
-# pon no si el certificado HTTPS es autofirmado
-verify_ssl = yes
-# segundos que Deluge espera los metadatos de cada magnet
-timeout = 120
-"""
-
-
-def parse_magnet(uri):
-    """-> dict(uri, infohash, name, size) o None."""
-    import base64 as b64
-    from urllib.parse import urlparse, parse_qs
-    uri = uri.strip()
-    if not uri.lower().startswith("magnet:"):
-        return None
-    q = parse_qs(urlparse(uri).query)
-    for xt in q.get("xt", []):
-        if xt.lower().startswith("urn:btih:"):
-            h = xt[9:].strip()
-            if re.fullmatch(r"[0-9a-fA-F]{40}", h):
-                h = h.lower()
-            elif re.fullmatch(r"[A-Za-z2-7]{32}", h):
-                h = b64.b32decode(h.upper()).hex()
-            else:
-                return None
-            try:
-                size = int(q.get("xl", ["0"])[0])
-            except ValueError:
-                size = 0
-            return {"uri": uri, "infohash": h, "name": q.get("dn", [""])[0], "size": size}
-    return None
-
-
-def read_magnets(path):
-    """-> (magnets[], errores[]). Una por linea; admite lineas vacias y # comentarios."""
-    mags, errs, seen = [], [], set()
-    for n, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        m = parse_magnet(line)
-        if m is None:
-            errs.append(f"linea {n}: no es un magnet valido")
-        elif m["infohash"] not in seen:
-            seen.add(m["infohash"])
-            mags.append(m)
-    return mags, errs
-
-
-class DelugeWeb:
-    """Cliente minimo del JSON-RPC del Web UI de Deluge 2.x."""
-
-    def __init__(self, url, password, http_user="", http_pass="", verify=True, timeout=120):
-        import http.cookiejar
-        import ssl
-        import base64 as b64
-        url = url.strip().rstrip("/")
-        self.url = url if url.lower().endswith("/json") else url + "/json"
-        self.password, self.timeout, self._id = password, timeout, 0
-        handlers = [urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())]
-        if not verify:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            handlers.append(urllib.request.HTTPSHandler(context=ctx))
-        self.opener = urllib.request.build_opener(*handlers)
-        self.headers = {"Content-Type": "application/json", "User-Agent": UA}
-        if http_user:
-            tok = b64.b64encode(f"{http_user}:{http_pass}".encode()).decode()
-            self.headers["Authorization"] = "Basic " + tok
-
-    def call(self, method, params=None, timeout=None):
-        self._id += 1
-        body = json.dumps({"method": method, "params": params or [], "id": self._id}).encode()
-        req = urllib.request.Request(self.url, data=body, headers=self.headers, method="POST")
-        try:
-            with self.opener.open(req, timeout=timeout or self.timeout) as r:
-                data = json.loads(r.read().decode("utf-8", errors="replace"))
-        except urllib.error.HTTPError as e:
-            hint = " (usuario/contrasena HTTP: revisa http_user/http_pass)" if e.code == 401 else ""
-            raise RuntimeError(f"HTTP {e.code} en {self.url}{hint}")
-        except (urllib.error.URLError, OSError, ValueError) as e:
-            raise RuntimeError(f"no se pudo hablar con {self.url}: {getattr(e, 'reason', e)}")
-        if data.get("error"):
-            raise RuntimeError(f"{method}: {data['error'].get('message', data['error'])}")
-        return data.get("result")
-
-    def login(self):
-        if not self.call("auth.login", [self.password]):
-            raise RuntimeError("contrasena del Web UI incorrecta")
-        if not self.call("web.connected"):
-            hosts = self.call("web.get_hosts") or []
-            if not hosts:
-                raise RuntimeError("el Web UI no tiene ningun daemon configurado (Connection Manager)")
-            self.call("web.connect", [hosts[0][0]])
-
-    def magnet_metadata(self, uri, wait):
-        """Metadatos bencodeados (el diccionario 'info') del magnet, sin agregarlo a Deluge."""
-        import base64 as b64
-        res = self.call("core.prefetch_magnet_metadata", [uri, int(wait)], timeout=wait + 60)
-        if not res or len(res) < 2 or not res[1]:
-            raise RuntimeError("Deluge no devolvio metadatos (sin peers/seeds a tiempo; sube 'timeout' y reintenta)")
-        meta = res[1]
-        return b64.b64decode(meta if isinstance(meta, (str, bytes)) else str(meta))
-
-
-def session_file_list(cli, m):
-    """Si el torrent YA esta en la sesion de Deluge, toma su lista de archivos de ahi (sin tocarlo).
-    -> dict listo para guardar como .torrent.json, o lanza RuntimeError."""
-    st = cli.call("core.get_torrent_status", [m["infohash"], ["name", "files", "piece_length", "total_size"]])
-    files = (st or {}).get("files") or []
-    if not files:
-        raise RuntimeError("esta en Deluge pero todavia sin metadatos (espera a que muestre su tamano y reintenta)")
-    out = []
-    for f in files:
-        path = str(f["path"])
-        if "/.pad/" in path or "_____padding_file" in path:
-            continue
-        out.append({"index": int(f["index"]), "path": path, "size": int(f["size"])})
-    return {"name": st.get("name") or m["name"] or m["infohash"], "infohash": m["infohash"],
-            "piece_length": int(st.get("piece_length") or 0), "count": len(files), "files": out}
-
-
-def load_deluge(args):
-    """Lee jd_deluge.ini (o lo pide una vez y lo guarda con permisos 600). Devuelve DelugeWeb o None."""
-    conf = STATE_DIR / DELUGE_CONF
-    cp = configparser.ConfigParser(interpolation=None)
-    if conf.is_file():
-        cp.read(conf, encoding="utf-8")
-    sec = cp["deluge"] if cp.has_section("deluge") else {}
-    url, pw = (sec.get("url", "") or "").strip(), sec.get("password", "") or ""
-    if not url or not pw or "TU_" in url:
-        if not sys.stdin.isatty():
-            if not conf.is_file():
-                conf.write_text(DELUGE_TEMPLATE.format(url="https://TU_SERVIDOR/deluge", password="TU_PASSWORD"), encoding="utf-8")
-            log(f"Falta configurar Deluge. Edita {conf} (url y password) y vuelve a correr.")
-            return None
-        import getpass
-        log(f"\nNo hay datos de Deluge. Se guardan en {conf} (permisos 600, solo en tu NAS; no va a GitHub).")
-        url = input("URL del Web UI de Deluge (ej. https://xxxx.appboxes.co/deluge): ").strip()
-        pw = getpass.getpass("Contrasena del Web UI (no se muestra): ")
-        if not url or not pw:
-            log("Cancelado.")
-            return None
-        if not args.dry_run:
-            conf.write_text(DELUGE_TEMPLATE.format(url=url, password=pw), encoding="utf-8")
-            try:
-                os.chmod(conf, 0o600)
-            except OSError:
-                pass
-        cp.read_string(DELUGE_TEMPLATE.format(url=url, password=pw))
-        sec = cp["deluge"]
-    try:
-        tmo = int((sec.get("timeout", "120") or "120").strip())
-    except ValueError:
-        tmo = 120
-    return DelugeWeb(url, pw, (sec.get("http_user", "") or "").strip(), sec.get("http_pass", "") or "",
-                     (sec.get("verify_ssl", "yes") or "yes").strip().lower() not in ("no", "false", "0"), tmo)
-
-
-def cmd_magnets(root, args):
-    """magnets.list -> torrents/*.torrent. Le pide a TU Deluge los metadatos (lista de archivos) de cada
-    magnet sin agregarlo ni bajar datos. Los que ya tienen .torrent (mismo infohash) se saltan."""
-    mf = STATE_DIR / MAGNETS_FILE
-    if not mf.is_file():
-        log(f"No existe {mf}. Crea ese archivo con un magnet por linea y vuelve a correr.")
-        return
-    mags, errs = read_magnets(mf)
-    for e in errs:
-        log(f"[!] {MAGNETS_FILE}: {e}")
-    if not mags:
-        log("No hay magnets validos.")
-        return
-    tdir = STATE_DIR / TORRENTS_DIR
-    have = {t["infohash"]: t for t in index_torrents(tdir)[0]}
-    todo = [m for m in mags if m["infohash"] not in have]
-    log(f"Magnets: {len(mags)} | ya tienen .torrent: {len(mags) - len(todo)} | por obtener: {len(todo)}")
-    for m in mags:
-        mark = "ya tiene .torrent" if m["infohash"] in have else "por obtener"
-        log(f"  - {m['name'] or m['infohash']}  ({fmt_size(m['size']) if m['size'] else '?'})  [{mark}]")
-    if not todo:
-        return
-    if args.dry_run:
-        log("[DRY-RUN] no se contacta a Deluge.")
-        return
-    cli = load_deluge(args)
-    if cli is None:
-        return
-    try:
-        cli.login()
-    except RuntimeError as e:
-        log(f"[!] Deluge: {e}")
-        return
-    tdir.mkdir(exist_ok=True)
-    ok = 0
-    for m in todo:
-        label = m["name"] or m["infohash"]
-        log(f"\nPidiendo metadatos de: {label} (puede tardar hasta {cli.timeout}s)...")
-        try:
-            meta = cli.magnet_metadata(m["uri"], cli.timeout)
-        except RuntimeError as e:
-            if "already exists" not in str(e):
-                log(f"[!] {label}: {e}")
-                continue
-            log("  Ya esta en tu Deluge: se toma la lista de archivos de ahi (no se modifica nada en Deluge).")
-            try:
-                j = session_file_list(cli, m)
-                fname = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", label).strip(" .") or m["infohash"]
-                dest = tdir / (fname + ".torrent.json")
-                dest.write_text(json.dumps(j, ensure_ascii=False), encoding="utf-8")
-                t = read_torrent(dest)
-            except (RuntimeError, OSError, ValueError, KeyError, TypeError) as e2:
-                log(f"[!] {label}: {e2}")
-                continue
-            ok += 1
-            log(f"  OK {dest.name}: {len(t['files'])} archivos, {fmt_size(t['total'])}")
-            continue
-        if hashlib.sha1(meta).hexdigest() != m["infohash"]:
-            log(f"[!] {label}: los metadatos recibidos NO coinciden con el hash del magnet; se descartan.")
-            continue
-        fname = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", label).strip(" .") or m["infohash"]
-        dest = tdir / (fname + ".torrent")
-        tmp = dest.with_name(dest.name + ".part")
-        tmp.write_bytes(b"d4:info" + meta + b"e")
-        try:
-            t = read_torrent(tmp)
-        except (OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError) as e:
-            tmp.unlink()
-            log(f"[!] {label}: metadatos ilegibles ({e})")
-            continue
-        os.replace(tmp, dest)
-        ok += 1
-        extra = ""
-        if m["size"] and abs(t["total"] - m["size"]) > max(1024 * 1024, m["size"] // 100):
-            extra = f"  [aviso: el magnet decia {fmt_size(m['size'])}]"
-        log(f"  OK {dest.name}: {len(t['files'])} archivos, {fmt_size(t['total'])}{extra}")
-    log(f"\nTorrents obtenidos: {ok} de {len(todo)}. Siguiente: opcion c (discos) o t (zips).")
 
 
 def cmd_organize(root, args):
