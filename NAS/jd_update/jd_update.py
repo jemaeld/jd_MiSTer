@@ -15,6 +15,8 @@ Sin argumentos abre un MENU numerado. Tambien se puede usar directo (cron, scrip
     python3 jd_update.py rebuild         # check + crea zips "solucionables" a partir de tus zips
     python3 jd_update.py rescan          # regenera jd_roms.db (indice de la fuente)
     python3 jd_update.py all             # update + organize + copy
+    python3 jd_update.py torrents        # lee torrents/*.torrent y dats/ y planea que zips bajar (no descarga todavia)
+    python3 jd_update.py torrents --find tekken   # busca un juego/archivo dentro de los .torrent (zips, CHD...)
     python3 jd_update.py log             # lee JD_Check.log en la terminal (por secciones, con busqueda)
     python3 jd_update.py github          # trae de GitHub el script y las listas (jd_update.list, jd_exclude.list)
     python3 jd_update.py github-lists    # igual, pero solo las listas
@@ -1704,7 +1706,7 @@ def do_rebuild(root, R, args):
     return created, manual, targets
 
 
-def write_report(root, R, args, source_idx, copy_rep, rb):
+def write_report(root, R, args, source_idx, copy_rep, rb, tor_names=None):
     L = [
         "CHECK - JD Update (MRA / .rbf / ZIP)",
         f"Fecha: {datetime.now():%Y-%m-%d %H:%M:%S}",
@@ -1764,6 +1766,9 @@ def write_report(root, R, args, source_idx, copy_rep, rb):
                 where = "  [ruta: no se busca en la fuente]"
             else:
                 where = "  [en la fuente: SI -> corre copy]" if z in source_idx else "  [en la fuente: no]"
+            if tor_names is not None:
+                base = R.zip_orig[z].replace("\\", "/").strip("/").split("/")[-1].lower()
+                where += "  [torrent: SI]" if base in tor_names else "  [torrent: no]"
             L.append(f"{n}\t{R.zip_orig[z]}{where}")
     else:
         L.append("(ninguno)")
@@ -2251,6 +2256,374 @@ def cmd_log(root, args):
                 page_lines([f"=== {secs[i][0]} ==="] + secs[i][1])
 
 
+# =====================================================================
+#  TORRENTS: leer .torrent + datfiles (Pleasuredome) y planear que bajar (solo lo necesario)
+# =====================================================================
+TORRENTS_DIR = "torrents"      # junto al script: aqui van los .torrent
+DATS_DIR = "dats"              # junto al script: aqui van los datfiles (.zip / .dat / .xml)
+TORRENT_LOG = "JD_Torrents.log"
+
+
+def bdecode(data):
+    """Bencode -> (valor, (inicio, fin) de la clave 'info' del diccionario raiz).
+    El rango de 'info' sirve para sacar el infohash exacto sin volver a codificar."""
+    span = [None]
+
+    def parse(i, depth):
+        c = data[i:i + 1]
+        if c == b"i":
+            j = data.index(b"e", i)
+            return int(data[i + 1:j]), j + 1
+        if c == b"l":
+            i += 1
+            out = []
+            while data[i:i + 1] != b"e":
+                v, i = parse(i, depth + 1)
+                out.append(v)
+            return out, i + 1
+        if c == b"d":
+            i += 1
+            out = {}
+            while data[i:i + 1] != b"e":
+                k, i = parse(i, depth + 1)
+                start = i
+                v, i = parse(i, depth + 1)
+                if depth == 0 and k == b"info":
+                    span[0] = (start, i)
+                out[k] = v
+            return out, i + 1
+        if c.isdigit():
+            j = data.index(b":", i)
+            n = int(data[i:j])
+            j += 1
+            if j + n > len(data):
+                raise ValueError("bencode truncado")
+            return data[j:j + n], j + n
+        raise ValueError(f"bencode invalido en la posicion {i}")
+
+    value, _end = parse(0, 0)
+    return value, span[0]
+
+
+def _dec(b):
+    return b.decode("utf-8", errors="replace") if isinstance(b, (bytes, bytearray)) else str(b)
+
+
+def read_torrent(path):
+    """-> dict(file, name, infohash, piece_length, files[{index, path, size}], count, total).
+    'index' es la posicion real del archivo en el torrent (la que usan los clientes para
+    marcar prioridades); 'count' es cuantos archivos tiene en total (incluye relleno)."""
+    data = Path(path).read_bytes()
+    meta, span = bdecode(data)
+    if not isinstance(meta, dict) or span is None or not isinstance(meta.get(b"info"), dict):
+        raise ValueError("no es un .torrent valido")
+    info = meta[b"info"]
+    name = _dec(info.get(b"name.utf-8") or info[b"name"])
+    files = []
+    if b"files" in info:
+        count = len(info[b"files"])
+        for idx, f in enumerate(info[b"files"]):
+            if b"p" in (f.get(b"attr") or b""):          # archivo de relleno (BEP 47)
+                continue
+            parts = f.get(b"path.utf-8") or f[b"path"]
+            files.append({"index": idx, "path": "/".join([name] + [_dec(p) for p in parts]),
+                          "size": int(f[b"length"])})
+    else:
+        count = 1
+        files.append({"index": 0, "path": name, "size": int(info[b"length"])})
+    return {"file": Path(path).name, "name": name, "infohash": hashlib.sha1(data[span[0]:span[1]]).hexdigest(),
+            "piece_length": int(info.get(b"piece length") or 0), "files": files, "count": count,
+            "total": sum(f["size"] for f in files)}
+
+
+def kind_of(name):
+    """'hbmame' o 'mame' segun el nombre del torrent / datfile."""
+    return "hbmame" if "hbmame" in name.lower() else "mame"
+
+
+def index_torrents(tdir):
+    """-> (torrents, {nombre de archivo en minusculas: [(torrent, archivo)]}, [(archivo, error)])."""
+    torrents, idx, errors = [], defaultdict(list), []
+    if not tdir.is_dir():
+        return torrents, idx, errors
+    for p in sorted(tdir.glob("*.torrent"), key=lambda x: x.name.lower()):
+        try:
+            t = read_torrent(p)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError) as e:
+            errors.append((p.name, f"no se pudo leer ({e})"))
+            continue
+        t["kind"] = kind_of(t["name"] + " " + t["file"])
+        torrents.append(t)
+        for f in t["files"]:
+            idx[f["path"].rsplit("/", 1)[-1].lower()].append((t, f))
+    return torrents, idx, errors
+
+
+def read_dat(path, wanted):
+    """Lee un datfile (XML tipo Logiqx/MAME, suelto o dentro de un .zip) en streaming.
+    Solo guarda los CRC de `wanted`. -> (hits {crc: [(juego, es_dueno_del_rom)]}, cloneof {juego: padre})."""
+    import xml.etree.ElementTree as ET
+    hits, cloneof = defaultdict(list), {}
+    zf = None
+    try:
+        if str(path).lower().endswith(".zip"):
+            zf = zipfile.ZipFile(path)
+            member = next((n for n in zf.namelist() if n.lower().endswith((".dat", ".xml"))), None)
+            if member is None:
+                raise ValueError("el zip no trae ningun .dat/.xml")
+            fh = zf.open(member)
+        else:
+            fh = open(path, "rb")
+        with fh:
+            root_el, n = None, 0
+            for ev, el in ET.iterparse(fh, events=("start", "end")):
+                if ev == "start":
+                    if root_el is None:
+                        root_el = el
+                    continue
+                if el.tag not in ("game", "machine"):
+                    continue
+                name = el.get("name") or ""
+                if el.get("cloneof"):
+                    cloneof[name] = el.get("cloneof")
+                for r in el.iter("rom"):
+                    crc = r.get("crc")
+                    if not crc:
+                        continue
+                    try:
+                        c = int(crc, 16)
+                    except ValueError:
+                        continue
+                    if c in wanted:
+                        hits[c].append((name, not r.get("merge")))
+                el.clear()
+                n += 1
+                if n % 2000 == 0 and root_el is not None:
+                    root_el.clear()
+    finally:
+        if zf is not None:
+            zf.close()
+    return hits, cloneof
+
+
+def dat_zips(crc, entries):
+    """Zips (en un set MERGED) que contienen ese CRC segun los DAT: el del padre raiz del juego que
+    es 'dueno' del rom. -> lista de nombres de zip, el mas probable primero."""
+    out = []
+    for hits, cloneof in entries:
+        for name, owner in sorted(hits.get(crc, ()), key=lambda x: not x[1]):
+            seen = set()
+            while cloneof.get(name) and name not in seen:
+                seen.add(name)
+                name = cloneof[name]
+            z = name + ".zip"
+            if z not in out:
+                out.append(z)
+    return out
+
+
+def fmt_size(n):
+    n = float(n)
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or u == "TB":
+            return f"{n:,.0f} {u}" if u in ("B", "KB") else f"{n:,.1f} {u}"
+        n /= 1024
+
+
+def missing_parts(R):
+    """Partes que no estan en NINGUN zip local de las MRA que no cargan (las SOLUCIONABLES se arreglan con
+    rebuild). -> [(entrada MRA, rom, parte, zips declarados)]."""
+    out = []
+    for e in R.entries:
+        if R.status.get(id(e)) != "FALTA":
+            continue
+        _fails, nowhere, _el = R.fail_info[id(e)]
+        ids = {id(p) for p in nowhere}
+        for rom, lack in R.fail_info[id(e)][0]:
+            for part in lack:
+                if id(part) in ids:
+                    out.append((e, rom, part, list(part["zips"] or rom["zips"])))
+    return out
+
+
+def plan_torrents(root, R, args, tidx, dat_entries, local_idx):
+    """Decide que zips bajar de los torrents. Por cada parte que falta:
+      1) con DAT: el zip del set MERGED que contiene ese CRC (aunque la MRA declare el zip de un clon);
+      2) si no, los zips que la MRA declara y que existen en algun torrent.
+    El destino sigue lo que declara la MRA (nombre simple -> games/mame; '/hbmame/x.zip' -> games/hbmame)."""
+    primary = (args.rom_dir or DEFAULT_ROM_DIRS)[0]
+    targets, local, unresolved = {}, {}, []
+    notes = Counter()
+
+    def dest_dir(declared):
+        for z in declared:
+            z = z.replace("\\", "/").strip()
+            if "/" in z.strip("/"):
+                return "games/" + "/".join(p for p in z.split("/")[:-1] if p)
+        return primary
+
+    for e, rom, part, declared in missing_parts(R):
+        rp = rel(root, e["path"])
+        kinds = ["hbmame", "mame"] if any("hbmame" in z.lower() for z in declared) else ["mame", "hbmame"]
+        cands = []   # (nombre de zip, viene del DAT, tipo preferido)
+        if part["crc"] is not None and dat_entries:
+            found = False
+            for k in kinds:
+                for z in dat_zips(part["crc"], dat_entries.get(k, [])):
+                    cands.append((z, True, k))
+                    found = True
+            if not found:
+                notes["crc_fuera_del_dat"] += 1
+        for z in declared:
+            cands.append((z.replace("\\", "/").split("/")[-1], False, None))
+
+        chosen = None
+        for zname, from_dat, k in cands:
+            options = tidx.get(zname.lower())
+            if not options:
+                continue
+            order = [k] if k else kinds
+            options = sorted(options, key=lambda o: order.index(o[0]["kind"]) if o[0]["kind"] in order else 9)
+            chosen = (options[0][0], options[0][1], from_dat)
+            break
+        if chosen is None:
+            unresolved.append((rp, part["name"], part["crc"], declared))
+            continue
+        t, f, from_dat = chosen
+        fname = f["path"].rsplit("/", 1)[-1]
+        ddir = dest_dir(declared)
+        dest = f"{ddir}/{fname}"
+        if (root / dest).exists():
+            notes["ya_existe_distinto"] += 1       # existe pero no trae lo que pide la MRA (otra version)
+            continue
+        if local_idx is not None and fname.lower() in local_idx:
+            local.setdefault(fname, set()).add(rp)
+            continue
+        tg = targets.setdefault(dest.lower(), {"name": fname, "dest": dest, "torrent": t, "file": f,
+                                               "mras": set(), "parts": 0, "dat": False})
+        tg["mras"].add(rp)
+        tg["parts"] += 1
+        tg["dat"] = tg["dat"] or from_dat
+    return {"targets": targets, "local": local, "unresolved": unresolved, "notes": notes}
+
+
+def render_plan(torrents, dats, plan, terrors, dat_errors):
+    L = ["TORRENTS - plan de descarga selectiva (no se descargo nada)",
+         f"Fecha: {datetime.now():%Y-%m-%d %H:%M:%S}", "", "=== TORRENTS LEIDOS ==="]
+    for t in torrents:
+        L.append(f"{t['file']}\t[{t['kind']}] {t['name']} | {len(t['files'])} archivos | {fmt_size(t['total'])} | "
+                 f"pieza {fmt_size(t['piece_length'])} | infohash {t['infohash']}")
+    L += [f"[!] {n}: {why}" for n, why in terrors]
+    L += ["", "=== DATFILES ===" ]
+    L += [f"{p.name}\t[{kind_of(p.name)}]" for p in dats] or ["(ninguno: sin DAT se usan solo los nombres de zip que declaran las MRA)"]
+    L += [f"[!] {n}: {why}" for n, why in dat_errors]
+    tg = plan["targets"]
+    by_t = defaultdict(list)
+    for v in tg.values():
+        by_t[v["torrent"]["file"]].append(v)
+    total = sum(v["file"]["size"] for v in tg.values())
+    L += ["", f"=== A BAJAR POR TORRENT ({len(tg)} zips, {fmt_size(total)}) ==="]
+    for tf, items in sorted(by_t.items()):
+        t = items[0]["torrent"]
+        s = sum(v["file"]["size"] for v in items)
+        extra = len(items) * 2 * t["piece_length"]
+        L.append(f"\n{tf}: {len(items)} zips, {fmt_size(s)}  (extra posible por piezas compartidas: hasta ~{fmt_size(extra)})")
+        for v in sorted(items, key=lambda x: x["name"].lower()):
+            tag = "DAT" if v["dat"] else "nombre"
+            L.append(f"  {fmt_size(v['file']['size']):>10}  {v['dest']}   ({len(v['mras'])} MRA, verificado por {tag}, "
+                     f"indice {v['file']['index']})")
+    if not tg:
+        L.append("(nada por bajar de los torrents)")
+    L += ["", f"=== YA ESTAN EN TU FUENTE LOCAL ({len(plan['local'])} zips): usa 'copy' en vez de torrent ==="]
+    L += [f"{z}\t({len(m)} MRA)" for z, m in sorted(plan["local"].items(), key=lambda kv: kv[0].lower())] or ["(ninguno)"]
+    un = plan["unresolved"]
+    L += ["", f"=== SIN FUENTE: no estan en ningun torrent ni en la fuente local ({len(un)} partes) ==="]
+    for rp, pname, crc, declared in un[:200]:
+        L.append(f"{rp}\t{pname} ({format(crc, '08x') if crc is not None else 'sin crc'})\tzips: {', '.join(declared) or '-'}")
+    if len(un) > 200:
+        L.append(f"... y {len(un) - 200} mas")
+    if not un:
+        L.append("(ninguno)")
+    n = plan["notes"]
+    L += ["", "=== AVISOS ===",
+          f"Partes cuyo CRC no esta en ningun DAT (otra version de MAME?): {n.get('crc_fuera_del_dat', 0)}",
+          f"Zips que ya existen en games/ pero no traen lo que pide la MRA (no se tocan): {n.get('ya_existe_distinto', 0)}",
+          "CHD: no salen de las MRA (los pide el core al cargar, ya convertidos a .hdd). Se buscan por nombre "
+          "con: torrents --find <juego>. La conversion a .hdd no esta en esta version."]
+    return L
+
+
+def find_in_torrents(torrents, text, limit=150):
+    """Busca `text` (sin distinguir mayusculas) en las rutas de TODOS los torrents (zips, CHD, lo que sea).
+    -> lineas para mostrar."""
+    needle = text.lower()
+    rows = [(t, f) for t in torrents for f in t["files"] if needle in f["path"].lower()]
+    if not rows:
+        return [f"(sin coincidencias para '{text}')"]
+    tot = sum(f["size"] for _t, f in rows)
+    out = [f"{len(rows)} archivo(s) con '{text}' | {fmt_size(tot)} en total"]
+    for t, f in rows[:limit]:
+        out.append(f"  {fmt_size(f['size']):>10}  [{t['file']}] {f['path']}   (indice {f['index']})")
+    if len(rows) > limit:
+        out.append(f"  ... y {len(rows) - limit} mas (afina la busqueda)")
+    return out
+
+
+def cmd_torrents(root, args):
+    """Lee los .torrent (torrents/) y los datfiles (dats/), cruza con lo que faltan las MRA y muestra
+    exactamente que zips y cuantos MB habria que bajar. NO descarga nada."""
+    tdir, ddir = STATE_DIR / TORRENTS_DIR, STATE_DIR / DATS_DIR
+    if not args.dry_run:
+        tdir.mkdir(exist_ok=True)
+        ddir.mkdir(exist_ok=True)
+    torrents, tidx, terrors = index_torrents(tdir)
+    for n, why in terrors:
+        log(f"[!] {n}: {why}")
+    if not torrents:
+        log(f"No hay .torrent en {tdir}. Copia ahi los de Pleasuredome (MAME / HBMAME ROMs merged) y vuelve a correr.")
+        return
+    log(f"Torrents: {len(torrents)} | archivos indexados: {sum(len(t['files']) for t in torrents)}")
+    if args.find:
+        print("\n".join(find_in_torrents(torrents, args.find)))
+        return
+    dats =[p for p in sorted(ddir.glob("*")) if p.suffix.lower() in (".zip", ".dat", ".xml")
+            and "chd" not in p.name.lower()] if ddir.is_dir() else []
+
+    excl = prepare_excludes(root, args)
+    R = analyze(root, args, excl)
+    parts = missing_parts(R)
+    wanted = {p["crc"] for _e, _r, p, _d in parts if p["crc"] is not None}
+    dat_entries, dat_errors = {}, []
+    if dats and wanted:
+        for p in dats:
+            log(f"Leyendo datfile {p.name} (puede tardar un poco)...")
+            try:
+                hits, clone = read_dat(p, wanted)
+            except Exception as e:  # noqa
+                dat_errors.append((p.name, f"no se pudo leer ({e})"))
+                log(f"[!] {p.name}: {e}")
+                continue
+            dat_entries.setdefault(kind_of(p.name), []).append((hits, clone))
+    local_idx = load_roms_db(Path(args.source).expanduser(), STATE_DIR / ROMS_DB, False, create=False)
+    plan = plan_torrents(root, R, args, tidx, dat_entries, local_idx)
+    L = render_plan(torrents, dats, plan, terrors, dat_errors)
+    try:
+        (STATE_DIR / TORRENT_LOG).write_text("\n".join(L) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+    tg = plan["targets"]
+    total = sum(v["file"]["size"] for v in tg.values())
+    log("")
+    log(f"Partes que faltan en las MRA que no cargan: {len(parts)}")
+    log(f"  -> a bajar de torrents: {len(tg)} zips, {fmt_size(total)}")
+    log(f"  -> ya en tu fuente local (usa copy): {len(plan['local'])} zips")
+    log(f"  -> sin fuente: {len(plan['unresolved'])} partes")
+    for k, v in plan["notes"].items():
+        log(f"  aviso: {k.replace('_', ' ')}: {v}")
+    log(f"Detalle: {STATE_DIR / TORRENT_LOG}")
+    log("(Esta version solo planea: todavia no descarga.)")
+
+
 def cmd_organize(root, args):
     mode = args.mode
     scan_dirs = list(args.scan or DEFAULT_SCAN)
@@ -2299,7 +2672,11 @@ def cmd_check(root, args, copy=False, rebuild=False):
             R = analyze(root, args, excl)
     if idx is None:
         idx = load_roms_db(source, db_path, False, create=False)
-    write_report(root, R, args, idx, copy_rep, rb)
+    tor_names = None
+    _tdir = STATE_DIR / TORRENTS_DIR
+    if _tdir.is_dir() and any(_tdir.glob("*.torrent")):
+        tor_names = set(index_torrents(_tdir)[1])
+    write_report(root, R, args, idx, copy_rep, rb, tor_names)
     log("")
     print_summary(root, R, args)
     return R
@@ -2337,6 +2714,8 @@ def run_action(act, root, args):
         cmd_organize(root, args)
         log("\n##### 3/3  REVISAR Y COPIAR ROMS #####")
         cmd_check(root, args, copy=True)
+    elif act == "torrents":
+        cmd_torrents(root, args)
     elif act == "log":
         cmd_log(root, args)
     elif act == "github":
@@ -2350,7 +2729,7 @@ def run_action(act, root, args):
     return failed
 
 
-ACCIONES = ["update", "organize", "check", "copy", "rebuild", "rescan", "all", "log", "github", "github-lists",
+ACCIONES = ["update", "organize", "check", "copy", "rebuild", "rescan", "all", "torrents", "log", "github", "github-lists",
             "undo-organize", "undo-rebuild"]
 MENU_ITEMS = [
     ("1", "update", "Actualizar               (descarga las DBs de jd_update.list)"),
@@ -2362,6 +2741,7 @@ MENU_ITEMS = [
     ("7", "all", "TODO: 1 + 2 + 4"),
     ("8", "undo-organize", "Deshacer el organizador"),
     ("9", "undo-rebuild", "Deshacer los zips creados por la opcion 5"),
+    ("t", "torrents", "Torrents: planear que bajar de los .torrent (solo planea; --find para buscar)"),
     ("v", "log", "Ver el log (JD_Check.log) aqui: secciones, busqueda"),
     ("g", "github", "Actualizar el script y las listas desde GitHub"),
     ("l", "github-lists", "Actualizar solo las listas (jd_update.list, jd_exclude.list) desde GitHub"),
@@ -2444,6 +2824,7 @@ def main():
     ap.add_argument("--cores-dir", default=DEFAULT_CORES_DIR, help=f"carpeta de los .rbf (def. {DEFAULT_CORES_DIR})")
     ap.add_argument("--source", default=SOURCE_DIR, help="carpeta fuente de ROMs merged (def. la fija del script)")
     ap.add_argument("--rescan", action="store_true", help="regenerar jd_roms.db antes de copiar")
+    ap.add_argument("--find", metavar="TEXTO", help="torrents: buscar un archivo/juego dentro de los .torrent")
     ap.add_argument("--section", metavar="N|TEXTO", help="log: mostrar una seccion (numero o parte del titulo)")
     ap.add_argument("--grep", metavar="TEXTO", help="log: buscar texto en el log (sin distinguir mayusculas)")
     ap.add_argument("--gh-repo", default=GITHUB_REPO, help=f"github: repositorio (def. {GITHUB_REPO}) o carpeta local")
