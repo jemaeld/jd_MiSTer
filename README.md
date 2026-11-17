@@ -40,7 +40,7 @@ Estos MRAs necesitan que tengas en `games/mame` los `.zip` de ROM correspondient
 `NAS/jd_update/` tiene mi gestor de ROMs y MRA, pensado para correr por SSH en el NAS (Python 3.8+, sin dependencias). No es un script del MiSTer: vive en la carpeta `jd_update/` dentro de la raíz de MiSTer (donde están `_Arcade` y `games`).
 
 ```
-python3 jd_update.py          # menú numerado
+python3 jd_update.py          # menú numerado con submenús: 4 ROMs, 5 Torrents y discos, 6 Logs, 7 Mantenimiento
 python3 jd_update.py all      # actualizar + organizar + revisar y copiar ROMs
 ```
 
@@ -51,15 +51,15 @@ python3 jd_update.py all      # actualizar + organizar + revisar y copiar ROMs
 
 Ajusta `SOURCE_DIR` al inicio del script con la ruta de tus ROMs.
 
-**Torrents (solo planea, todavía no descarga):** pon los `.torrent` de Pleasuredome (MAME / HBMAME ROMs *merged*) en `jd_update/torrents/` y, opcionalmente, sus datfiles en `jd_update/dats/`. `python3 jd_update.py torrents` (opción `t`) calcula qué zips faltan y cuántos MB serían, sin bajar el torrent completo; con los datfiles resuelve el zip del padre cuando la MRA pide el de un clon. `torrents --find texto` busca cualquier archivo dentro de los torrents (útil para CHD). Resultado en `JD_Torrents.log`.
+**Torrents (solo planea, todavía no descarga):** pon los `.torrent` de Pleasuredome (MAME / HBMAME ROMs *merged*) en `jd_update/torrents/` y, opcionalmente, sus datfiles en `jd_update/dats/`. `python3 jd_update.py torrents` (menú 5 → 3) calcula qué zips faltan y cuántos MB serían, sin bajar el torrent completo; con los datfiles resuelve el zip del padre cuando la MRA pide el de un clon. `torrents --find texto` busca cualquier archivo dentro de los torrents (útil para CHD). Resultado en `JD_Torrents.log`.
 
-**Discos (HDD / IMG / CHD), solo revisa:** `python3 jd_update.py disks` (opción `c`) lee los `<file ... path="*.hdd|*.img|*.chd">` de las MRA y dice cuáles existen en `games/<core>/`, cuáles tienen el CHD ya local (falta convertir), cuáles salen de un `.torrent` de CHDs (con tamaño) y cuáles no tienen fuente. Resultado en `JD_Discos.log` y `JD_Discos.json`. Todavía no descarga ni convierte.
+**Discos (HDD / IMG / CHD), solo revisa:** `python3 jd_update.py disks` (menú 5 → 2) lee los `<file ... path="*.hdd|*.img|*.chd">` de las MRA y dice cuáles existen en `games/<core>/`, cuáles tienen el CHD ya local (falta convertir), cuáles salen de un `.torrent` de CHDs (con tamaño) y cuáles no tienen fuente. Resultado en `JD_Discos.log` y `JD_Discos.json`. Todavía no descarga ni convierte.
 
-**Magnets → `.torrent` (solo metadatos):** pon un magnet por línea en `jd_update/magnets.list` y corre `python3 jd_update.py magnets` (opción `m`). Le pide a tu Deluge (Web UI) la lista de archivos de cada magnet con `core.prefetch_magnet_metadata` —sin agregarlo ni bajar datos—, verifica el hash y guarda el `.torrent` en `jd_update/torrents/`. La URL y contraseña del Web UI se piden una vez y quedan en `jd_update/jd_deluge.ini` (permisos 600, solo en el NAS; no se sube a GitHub).
+**Magnets → `.torrent` (solo metadatos):** pon un magnet por línea en `jd_update/magnets.list` y corre `python3 jd_update.py magnets` (menú 5 → 1). Le pide a tu Deluge (Web UI) la lista de archivos de cada magnet con `core.prefetch_magnet_metadata` —sin agregarlo ni bajar datos—, verifica el hash y guarda el `.torrent` en `jd_update/torrents/`. La URL y contraseña del Web UI se piden una vez y quedan en `jd_update/jd_deluge.ini` (permisos 600, solo en el NAS; no se sube a GitHub).
 
-Para leer `JD_Check.log` sin salir de la terminal: opción `v` del menú, o `python3 jd_update.py log` (`--section N` muestra una sección, `--grep texto` busca en todo el log).
+Para leer `JD_Check.log` sin salir de la terminal: menú 6 (Ver logs), o `python3 jd_update.py log` (`--section N` muestra una sección, `--grep texto` busca en todo el log).
 
-Para traer de aquí el script y las listas (`jd_update.list`, `jd_exclude.list`) a tu NAS: opción `g` del menú, o `python3 jd_update.py github` (`github-lists` solo trae las listas). Muestra qué cambia, pide confirmación y guarda copia `.bak`.
+Para traer de aquí el script y las listas (`jd_update.list`, `jd_exclude.list`) a tu NAS: menú 7 → 1, o `python3 jd_update.py github` (`github-lists` solo trae las listas). Muestra qué cambia, pide confirmación y guarda copia `.bak`.
 
 ## Configuración
 

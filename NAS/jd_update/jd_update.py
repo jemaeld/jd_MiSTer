@@ -2218,7 +2218,7 @@ def pick_section(secs, key):
 def cmd_log(root, args):
     path = STATE_DIR / args.log
     if not path.is_file():
-        log(f"No hay log todavia ({path}). Corre la opcion 3 (Revisar) o 'check'.")
+        log(f"No hay log todavia ({path}). Corre antes la accion que lo genera (revisar, discos o torrents).")
         return
     head, secs = read_log_sections(path)
     if args.grep:
@@ -3159,63 +3159,110 @@ def run_action(act, root, args):
 
 ACCIONES = ["update", "organize", "check", "copy", "rebuild", "rescan", "all", "torrents", "magnets", "disks", "log", "github", "github-lists",
             "undo-organize", "undo-rebuild"]
-MENU_ITEMS = [
-    ("1", "update", "Actualizar               (descarga las DBs de jd_update.list)"),
-    ("2", "organize", "Organizar MRA            (_CORE, _A-Z, _DEBUT, _UPDATED...)"),
-    ("3", "check", "Revisar                  (solo lee; genera JD_Check.log)"),
-    ("4", "copy", "Revisar y COPIAR ROMs que faltan desde la fuente"),
-    ("5", "rebuild", "Revisar y reconstruir zips solucionables (con lo que ya tienes)"),
-    ("6", "rescan", "Reescanear la fuente de ROMs (regenera jd_roms.db)"),
-    ("7", "all", "TODO: 1 + 2 + 4"),
-    ("8", "undo-organize", "Deshacer el organizador"),
-    ("9", "undo-rebuild", "Deshacer los zips creados por la opcion 5"),
-    ("t", "torrents", "Torrents: planear que bajar de los .torrent (solo planea; --find para buscar)"),
-    ("m", "magnets", "Magnets: convertir magnets.list en .torrent usando tu Deluge (solo metadatos)"),
-    ("c", "disks", "Discos: que MRA piden HDD/IMG/CHD, cuales faltan y de donde saldrian (solo revisa)"),
-    ("v", "log", "Ver el log (JD_Check.log) aqui: secciones, busqueda"),
-    ("g", "github", "Actualizar el script y las listas desde GitHub"),
-    ("l", "github-lists", "Actualizar solo las listas (jd_update.list, jd_exclude.list) desde GitHub"),
+# Menu en arbol: (tecla, texto, accion) o (tecla, texto, [submenu]) o (tecla, texto, accion, {ajustes a args}).
+# Los comandos de linea (python3 jd_update.py update, check, ...) no cambian: esto es solo el menu.
+MENU = [
+    ("1", "TODO: actualizar + organizar + copiar ROMs", "all"),
+    ("2", "Actualizar DBs                (descarga lo de jd_update.list)", "update"),
+    ("3", "Organizar MRA                 (_CORE, _A-Z, _DEBUT, _UPDATED...)", "organize"),
+    ("4", "ROMs: revisar, copiar, reconstruir", [
+        ("1", "Revisar                (solo lee; genera JD_Check.log)", "check"),
+        ("2", "Revisar y COPIAR los zips que faltan desde la fuente", "copy"),
+        ("3", "Reconstruir zips solucionables (con lo que ya tienes)", "rebuild"),
+        ("4", "Reescanear la fuente de ROMs (regenera jd_roms.db)", "rescan"),
+    ]),
+    ("5", "Torrents y discos (CHD / HDD / IMG)", [
+        ("1", "Magnets -> .torrent     (magnets.list; pide solo metadatos a tu Deluge)", "magnets"),
+        ("2", "Discos: que MRA piden HDD/IMG/CHD y cuales faltan (solo revisa)", "disks"),
+        ("3", "Zips: planear que bajar de los torrents (solo planea)", "torrents"),
+        ("4", "Buscar un archivo o juego dentro de los torrents", "torrents", {"_ask_find": True}),
+    ]),
+    ("6", "Ver logs", [
+        ("1", "Revision de ROMs (JD_Check.log)", "log", {"log": CHECK_LOG}),
+        ("2", "Discos (JD_Discos.log)", "log", {"log": DISKS_LOG}),
+        ("3", "Torrents (JD_Torrents.log)", "log", {"log": TORRENT_LOG}),
+    ]),
+    ("7", "Mantenimiento", [
+        ("1", "Actualizar el script y las listas desde GitHub", "github"),
+        ("2", "Actualizar solo las listas (jd_update.list, jd_exclude.list)", "github-lists"),
+        ("3", "Deshacer el organizador", "undo-organize"),
+        ("4", "Deshacer los zips creados por 'Reconstruir'", "undo-rebuild"),
+    ]),
 ]
 
 
-def menu(root, args):
-    keys = {k: act for k, act, _t in MENU_ITEMS}
+def _run_leaf(act, extra, root, args):
+    """Ejecuta una accion del menu con ajustes temporales a args. Devuelve False si se debe salir del menu."""
+    saved = {}
+    extra = dict(extra or {})
+    if extra.pop("_ask_find", False):
+        try:
+            txt = input("Texto a buscar (nombre de juego o archivo, ej. area51): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return True
+        if not txt:
+            return True
+        extra["find"] = txt
+    for k, v in extra.items():
+        saved[k] = getattr(args, k, None)
+        setattr(args, k, v)
+    try:
+        run_action(act, root, args)
+    except SystemExit as e:
+        if e.code not in (None, 0):
+            log(str(e.code))
+    except KeyboardInterrupt:
+        log("\nInterrumpido.")
+    finally:
+        for k, v in saved.items():
+            setattr(args, k, v)
+    if _RESTART:
+        print("\nEl script se actualizo: vuelve a ejecutarlo para usar la version nueva.")
+        return False
+    if act != "log":
+        try:
+            input("\nEnter para continuar...")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+    return True
+
+
+def run_menu(title, items, root, args, top=False):
+    """Un nivel del menu. Devuelve False si hay que salir de todo."""
+    keys = {it[0]: it for it in items}
     while True:
-        print(f"\n===== JD Update =====   Raiz: {root}")
-        for k, _a, t in MENU_ITEMS:
-            print(f" {k}) {t}")
+        print(f"\n===== {title} =====" + (f"   Raiz: {root}" if top else ""))
+        for it in items:
+            print(f" {it[0]}) {it[1]}" + ("   >" if isinstance(it[2], list) else ""))
         print(f" d) Dry-run (simular, no cambia nada): {'SI' if args.dry_run else 'no'}")
-        print(" 0) Salir")
+        print(" 0) " + ("Salir" if top else "Volver"))
         try:
             op = input("Opcion: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
-            return
-        if op in ("0", "q", "s", "salir", ""):
-            if op == "":
-                continue
-            return
+            return False
+        if op == "":
+            continue
+        if op in ("0", "q", "s", "salir", "volver"):
+            return not top
         if op == "d":
             args.dry_run = not args.dry_run
             continue
-        if op not in keys:
+        it = keys.get(op)
+        if it is None:
             print("Opcion no valida.")
             continue
-        try:
-            run_action(keys[op], root, args)
-        except SystemExit as e:
-            if e.code not in (None, 0):
-                log(str(e.code))
-        except KeyboardInterrupt:
-            log("\nInterrumpido.")
-        if _RESTART:
-            print("\nEl script se actualizo: vuelve a ejecutarlo para usar la version nueva.")
-            return
-        try:
-            input("\nEnter para volver al menu...")
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return
+        if isinstance(it[2], list):
+            if not run_menu(f"JD Update > {it[1].split('(')[0].strip()}", it[2], root, args):
+                return False
+        elif not _run_leaf(it[2], it[3] if len(it) > 3 else None, root, args):
+            return False
+
+
+def menu(root, args):
+    run_menu("JD Update", MENU, root, args, top=True)
 
 
 def detect_root():
