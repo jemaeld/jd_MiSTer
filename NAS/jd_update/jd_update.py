@@ -2789,14 +2789,21 @@ def cmd_disks(root, args):
                     it["status"] = "SIN FUENTE" if torrents else "SIN TORRENT CARGADO"
         items.append(it)
 
-    # ---- OSD: nombres citados en comentarios ----
+    # ---- OSD: nombres citados en comentarios (se agrupa por nombre sin extension: x.chd + x.hdd = un disco) ----
+    chd_folders = defaultdict(list)                   # carpeta del juego (minusculas) -> [(torrent, archivo)]
+    for t in torrents:
+        for f in t["files"]:
+            if f["path"].lower().endswith(".chd") and f["path"].count("/") >= 2:
+                chd_folders[f["path"].split("/")[-2].lower()].append((t, f))
     osd = {}
     for e in entries:
         for w in e.get("cdisks", []):
             stem = os.path.splitext(w)[0]
             if stem.lower() in fixed_stems:
                 continue
-            o = osd.setdefault(w.lower(), {"name": w, "stem": stem, "mras": [], "rbfs": set(), "sets": []})
+            o = osd.setdefault(stem.lower(), {"stem": stem, "names": [], "mras": [], "rbfs": set(), "sets": []})
+            if w.lower() not in [x.lower() for x in o["names"]]:
+                o["names"].append(w)
             o["mras"].append(rel(root, e["path"]))
             if e["rbf"].strip():
                 o["rbfs"].add(rbf_basename(e["rbf"]))
@@ -2806,13 +2813,18 @@ def cmd_disks(root, args):
     for k in sorted(osd):
         o = osd[k]
         chd = o["stem"] + ".chd"
-        it = {"kind": "OSD", "dest": None, "name": o["name"], "ext": os.path.splitext(o["name"])[1].lower(),
-              "rbfs": sorted(o["rbfs"]), "mras": o["mras"], "chd_name": chd, "chd_local": None, "torrent": None,
-              "size": 0, "group": ", ".join(sorted(o["rbfs"])) or "?"}
-        loc = local_disk_search(root, o["name"], o["sets"], o["rbfs"]) or (
-            local_disk_search(root, chd, o["sets"], o["rbfs"]) if chd.lower() != o["name"].lower() else None)
-        if loc is not None:
-            it.update(chd_local=rel(root, loc), status="LOCAL", size=loc.stat().st_size)
+        raw = [n for n in o["names"] if not n.lower().endswith(".chd")]     # la MRA pide el .hdd/.img convertido
+        want = raw[0] if raw else chd
+        it = {"kind": "OSD", "dest": None, "name": want, "ext": os.path.splitext(want)[1].lower(),
+              "pide": " + ".join(sorted({os.path.splitext(n)[1].lower() for n in o["names"]})),
+              "rbfs": sorted(o["rbfs"]), "mras": list(dict.fromkeys(o["mras"])), "chd_name": chd, "chd_local": None,
+              "torrent": None, "size": 0, "convert": bool(raw), "group": ", ".join(sorted(o["rbfs"])) or "?"}
+        have = local_disk_search(root, want, o["sets"], o["rbfs"])
+        have_chd = local_disk_search(root, chd, o["sets"], o["rbfs"]) if raw else have
+        if have is not None:
+            it.update(chd_local=rel(root, have), status="LOCAL", size=have.stat().st_size)
+        elif have_chd is not None:
+            it.update(chd_local=rel(root, have_chd), status="CONVERTIR", size=have_chd.stat().st_size)
         else:
             r = tor_row(chd, o["sets"])
             if r:
@@ -2821,17 +2833,23 @@ def cmd_disks(root, args):
                           torrent={"file": t["file"], "path": f["path"], "size": f["size"], "index": f["index"]})
             else:
                 it["status"] = "SIN FUENTE" if torrents else "SIN TORRENT CARGADO"
+                near = []                              # CHD de la carpeta del set cuyo nombre empieza igual
+                for c in o["sets"]:
+                    near += [x for x in chd_folders.get(c.lower(), [])]
+                pref = [x for x in near if x[1]["path"].rsplit("/", 1)[-1].lower().startswith(o["stem"].lower())]
+                cand = pref or near
+                if cand:
+                    it["candidatos"] = [{"file": t["file"], "path": f["path"], "size": f["size"], "index": f["index"]}
+                                        for t, f in cand[:12]]
+                    if len(pref) == 1:                 # un solo CHD empieza igual: casi seguro es ese
+                        t, f = pref[0]
+                        it.update(status="APROX", size=f["size"], chd_name=f["path"].rsplit("/", 1)[-1],
+                                  torrent={"file": t["file"], "path": f["path"], "size": f["size"], "index": f["index"]})
         items.append(it)
 
     # ---- POSIBLE: CHD del set de MAME que la MRA no menciona ----
     covered = {it["torrent"]["path"] for it in items if it["torrent"]}
-    folders = defaultdict(list)                       # carpeta del juego (minusculas) -> [(torrent, archivo)]
-    for t in torrents:
-        for f in t["files"]:
-            if f["path"].lower().endswith(".chd") and "/" in f["path"]:
-                parts = f["path"].split("/")
-                if len(parts) >= 3:
-                    folders[parts[-2].lower()].append((t, f))
+    folders = chd_folders
     named = {it["name"].lower() for it in items} | {(it["chd_name"] or "").lower() for it in items}
     poss = {}
     for e in entries:
@@ -2868,7 +2886,7 @@ def cmd_disks(root, args):
     desc = {"FIJO": "la MRA trae <file> con el destino exacto en games/",
             "OSD": "la MRA solo nombra el disco en un comentario (ranura del OSD)",
             "POSIBLE": "el set de MAME tiene CHD pero la MRA no lo menciona (revisar)"}
-    order = {"OK": 6, "LOCAL": 6, "COPIAR": 1, "CONVERTIR": 1, "BAJAR": 2, "POSIBLE": 3, "SIN FUENTE": 0, "SIN TORRENT CARGADO": 0}
+    order = {"OK": 6, "LOCAL": 6, "COPIAR": 1, "CONVERTIR": 1, "BAJAR": 2, "APROX": 3, "POSIBLE": 4, "SIN FUENTE": 0, "SIN TORRENT CARGADO": 0}
     L = [f"===== DISCOS (HDD / IMG / CHD) =====   {datetime.now():%Y-%m-%d %H:%M:%S}",
          f"Raiz: {root}", f"MRAs unicas: {nm}", f"Torrents cargados: {len(torrents)} ({tdir})", ""]
     for kd in kinds:
@@ -2891,7 +2909,7 @@ def cmd_disks(root, args):
         c = Counter(i["status"] for i in byg[(kd, g)])
         L.append(f"  {kd:<8} {g:<30} " + ", ".join(f"{k} {v}" for k, v in sorted(c.items(), key=lambda kv: order.get(kv[0], 9))))
     for kd in kinds:
-        for st in ("SIN FUENTE", "SIN TORRENT CARGADO", "BAJAR", "POSIBLE", "CONVERTIR", "COPIAR", "LOCAL", "OK"):
+        for st in ("SIN FUENTE", "SIN TORRENT CARGADO", "APROX", "BAJAR", "POSIBLE", "CONVERTIR", "COPIAR", "LOCAL", "OK"):
             sel = [i for i in items if i["kind"] == kd and i["status"] == st]
             if not sel:
                 continue
@@ -2905,6 +2923,8 @@ def cmd_disks(root, args):
                     continue
                 L.append((i["dest"] or i["name"]) + f"   [core: {', '.join(i['rbfs']) or '?'}]")
                 L.append(f"    MRA: {i['mras'][0]}" + (f"  (+{len(i['mras']) - 1} mas)" if len(i["mras"]) > 1 else ""))
+                if i.get("pide"):
+                    L.append(f"    la MRA pide: {i['pide']}" + ("  (el .hdd/.img sale de convertir el CHD)" if i.get("convert") else ""))
                 if st in ("OK", "LOCAL"):
                     L.append(f"    {i['chd_local'] or i['dest']}  {fmt_size(i['size'])}")
                     continue
@@ -2915,6 +2935,10 @@ def cmd_disks(root, args):
                 if i["torrent"]:
                     t = i["torrent"]
                     L.append(f"    torrent: [{t['file']}] {t['path']}  {fmt_size(t['size'])}  (indice {t['index']})")
+                if st == "APROX":
+                    L.append("    (nombre aproximado: es el unico CHD del set que empieza igual; confirmar)")
+                for cd in i.get("candidatos", []) if st == "SIN FUENTE" else []:
+                    L.append(f"    candidato en el set: {cd['path']}  {fmt_size(cd['size'])}")
                 if st.startswith("SIN"):
                     L.append("    (busca el nombre con:  python3 jd_update.py torrents --find " + (i["chd_name"] or i["name"]).rsplit(".", 1)[0] + ")")
     try:
