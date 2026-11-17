@@ -3491,7 +3491,7 @@ def convert_chd(tool, chd, out_final, keep_chd_at=None):
 
 class FtpFetch:
     def __init__(self, cfg):
-        self.cfg, self.ftp, self.prefix = cfg, None, {}
+        self.cfg, self.ftp, self.prefix, self.found = cfg, None, {}, {}
 
     def connect(self):
         import ftplib
@@ -3527,13 +3527,77 @@ class FtpFetch:
     def _size(self, path):
         import ftplib
         try:
+            self.ftp.voidcmd("TYPE I")
             return self.ftp.size(path)
         except ftplib.Error:
             return None
 
+    def _ls(self, path):
+        """[(nombre, es_carpeta)] de una carpeta remota (MLSD si se puede; si no, NLST)."""
+        try:
+            return self._ls_raw(path)
+        finally:
+            try:
+                self.ftp.voidcmd("TYPE I")          # los listados dejan el FTP en modo ASCII, y SIZE ahi falla
+            except Exception:  # noqa
+                pass
+
+    def _ls_raw(self, path):
+        import ftplib
+        out = []
+        try:
+            for name, facts in self.ftp.mlsd(path or "/", facts=["type"]):
+                t = (facts.get("type") or "").lower()
+                if name in (".", "..") or t in ("cdir", "pdir"):
+                    continue
+                out.append((name, t == "dir"))
+            return out
+        except (ftplib.Error, OSError, AttributeError):
+            pass
+        try:
+            names = self.ftp.nlst(path or "/")
+        except (ftplib.Error, OSError):
+            return []
+        cwd = self.ftp.pwd()
+        for n in names:
+            n = n.rsplit("/", 1)[-1]
+            if n in (".", "..", ""):
+                continue
+            try:
+                self.ftp.cwd((path.rstrip("/") + "/" + n) if path else n)
+                out.append((n, True))
+            except ftplib.Error:
+                out.append((n, False))
+        try:
+            self.ftp.cwd(cwd)
+        except ftplib.Error:
+            pass
+        return out
+
+    def _discover(self, top, maxdepth=4):
+        """Carpetas del FTP llamadas `top` (el nombre del torrent), buscando desde la raiz. -> lista de rutas padre."""
+        if top in self.found:
+            return self.found[top]
+        hits, level = [], [""]
+        for _depth in range(maxdepth):
+            nxt = []
+            for base in level:
+                for name, isdir in self._ls(base or "/"):
+                    if not isdir:
+                        continue
+                    if name == top:
+                        hits.append(base)
+                    elif _depth < maxdepth - 1:
+                        nxt.append(base + "/" + name)
+            if hits:
+                break
+            level = nxt[:400]
+        self.found[top] = hits
+        return hits
+
     def locate(self, save_path, rel, size):
-        """Ruta REMOTA del archivo: save_path de Deluge + ruta dentro del torrent, quitando carpetas del principio
-        hasta que el FTP la reconozca (el FTP suele estar 'enjaulado' en una carpeta)."""
+        """Ruta REMOTA del archivo. Primero se prueba save_path de Deluge (quitando carpetas del principio, porque el
+        FTP suele estar 'enjaulado'); si no, se busca por el nombre de la carpeta del torrent en todo el FTP."""
         self.ensure()
         base = (self.cfg.get("base") or "").strip().rstrip("/")
         if base:
@@ -3541,11 +3605,6 @@ class FtpFetch:
             if self._size(p) == size:
                 return p
         parts = [x for x in (save_path or "").split("/") if x]
-        key = save_path
-        if key in self.prefix:
-            p = self.prefix[key] + "/" + rel
-            if self._size(p) == size:
-                return p
         tried = []
         for k in range(len(parts) + 1):
             pre = "/".join(parts[k:])
@@ -3553,10 +3612,20 @@ class FtpFetch:
                 p = lead + (pre + "/" if pre else "") + rel
                 tried.append(p)
                 if self._size(p) == size:
-                    self.prefix[key] = p[:-len(rel) - 1] if len(p) > len(rel) else ""
                     return p
-        raise RuntimeError("no encuentro el archivo en el FTP (tamano esperado " + fmt_size(size) + "). Probe: "
-                           + "; ".join(tried[:4]) + " ... Pon la ruta equivalente en 'base' del [ftp] de " + DELUGE_CONF)
+        top = rel.split("/")[0]
+        self.found.pop(top, None)               # el torrent puede haberse movido (downloading -> completed)
+        for parent in self._discover(top):
+            p = parent + "/" + rel
+            if self._size(p) == size:
+                return p
+        try:
+            root_names = ", ".join(n + ("/" if d else "") for n, d in self._ls("/")[:25])
+        except Exception:  # noqa
+            root_names = "?"
+        raise RuntimeError("no encuentro el archivo en el FTP (tamano esperado " + fmt_size(size) + "). Deluge dice "
+                           + (save_path or "?") + "; la raiz del FTP tiene: " + (root_names or "(vacia)")
+                           + ". Si el archivo esta en otra ruta, ponla en 'base' del [ftp] de " + DELUGE_CONF)
 
     def download(self, remote, local_part, size, label=""):
         """Descarga con reanudacion. Devuelve cuando el archivo local tiene exactamente `size` bytes."""
@@ -3767,11 +3836,24 @@ def fetch_torrent(root, args, cli, ftp, t, jobs, tdir, magnets, tool, keep_chd, 
     by_idx = {j["f"]["index"]: j for j in jobs}
     pending = set(wanted)
     total = sum(j["f"]["size"] for j in jobs)
-    last_line, last_prog, last_move = 0.0, -1, time.time()
+    last_line, last_prog, last_move, bad_polls = 0.0, -1, time.time(), 0
     flog(f"  Esperando {len(jobs)} archivo(s), {fmt_size(total)} (Ctrl+C para pausar: Deluge sigue y al volver a correr se retoma)")
     while pending:
-        st = cli.call("core.get_torrent_status", [tid, ["state", "file_progress", "save_path", "download_payload_rate",
-                                                         "num_peers", "num_seeds", "total_done", "message"]]) or {}
+        try:
+            st = cli.call("core.get_torrent_status", [tid, ["state", "file_progress", "save_path", "download_payload_rate",
+                                                             "num_peers", "num_seeds", "total_done", "message"]]) or {}
+            bad_polls = 0
+        except RuntimeError as e:
+            bad_polls += 1
+            if bad_polls > 30:
+                raise
+            flog(f"  [!] Deluge no respondio ({e}); reintento {bad_polls}/30")
+            time.sleep(min(15 * bad_polls, 60))
+            try:
+                cli.login()
+            except RuntimeError:
+                pass
+            continue
         state = (st.get("state") or "").lower()
         if state == "error":
             raise RuntimeError("Deluge marco el torrent con error: " + str(st.get("message") or "?"))
@@ -3787,7 +3869,17 @@ def fetch_torrent(root, args, cli, ftp, t, jobs, tdir, magnets, tool, keep_chd, 
                     free = shutil.disk_usage(STATE_DIR).free
                     if free < f["size"] + (1 << 30):
                         raise RuntimeError(f"falta espacio en el NAS ({fmt_size(free)} libres para {fmt_size(f['size'])})")
-                    remote = ftp.locate(st.get("save_path") or "", f["path"], f["size"])
+                    remote = None
+                    for attempt in range(8):
+                        try:
+                            remote = ftp.locate(st.get("save_path") or "", f["path"], f["size"])
+                            break
+                        except RuntimeError:
+                            if attempt == 7:
+                                raise
+                            flog("  (aun no aparece en el FTP; Deluge puede estar moviendo el torrent a 'completed'; reintento)")
+                            time.sleep(20)
+                            st = cli.call("core.get_torrent_status", [tid, ["save_path"]]) or st
                     flog(f"  Trayendo por FTP: {f['path'].rsplit('/', 1)[-1]} ({fmt_size(f['size'])})")
                     ftp.download(remote, str(staged) + ".part", f["size"], f["path"].rsplit("/", 1)[-1])
                     shutil.move(str(staged) + ".part", str(staged))
