@@ -2808,6 +2808,10 @@ def cmd_disks(root, args):
       POSIBLE  el set de MAME tiene CHD en el torrent pero la MRA no lo menciona (revisar a mano)
     Escribe JD_Discos.log y JD_Discos.json."""
     _ls_cache.clear()
+    try:
+        (STATE_DIR / DISKS_JSON).unlink()
+    except OSError:
+        pass
     problems = []
     entries = scan_mras(root, list(args.scan or CHECK_SCAN), problems)
     if not entries:
@@ -3039,7 +3043,7 @@ def cmd_disks(root, args):
     log(f"\nDetalle: {STATE_DIR / DISKS_LOG}   (datos para el siguiente paso: {DISKS_JSON})")
     if not torrents:
         log(f"Aviso: no hay .torrent en {tdir}; pon ahi el de MAME CHDs para saber cuales bajar.")
-    log("(Solo revisa: todavia no descarga ni convierte.)")
+    log("(Esto solo revisa. Para bajar y convertir: la opcion 1 del menu, o 5 > 5.)")
 
 
 # ====================================================================
@@ -3902,11 +3906,14 @@ def cmd_fetch(root, args):
     local_conv, notes = [], []
     if what != "zips":
         log("\n=== Paso 3: discos (CHD / HDD / IMG) ===")
-        try:
-            (STATE_DIR / DISKS_JSON).unlink()
-        except OSError:
-            pass
-        cmd_disks(root, args)
+        if getattr(args, "skip_disks_scan", False) and (STATE_DIR / DISKS_JSON).is_file():
+            log("(comprobacion de discos ya hecha en el paso anterior)")
+        else:
+            try:
+                (STATE_DIR / DISKS_JSON).unlink()
+            except OSError:
+                pass
+            cmd_disks(root, args)
         dj, local_conv, notes = disk_jobs(root, args, tmap)
         for k, v in dj.items():
             if k in jobs:
@@ -4093,8 +4100,12 @@ def run_action(act, root, args):
         cmd_organize(root, args)
     elif act == "check":
         cmd_check(root, args)
+        log("\n--- Discos (CHD / HDD / IMG) ---")
+        cmd_disks(root, args)
     elif act == "copy":
         cmd_check(root, args, copy=True)
+        log("\n--- Discos (CHD / HDD / IMG) ---")
+        cmd_disks(root, args)
     elif act == "rebuild":
         cmd_check(root, args, rebuild=True)
     elif act == "rescan":
@@ -4104,14 +4115,17 @@ def run_action(act, root, args):
         failed = run_update(args, root)["failed"]
         log("\n##### 2/4  ORGANIZAR MRA POR CORE #####")
         cmd_organize(root, args)
-        log("\n##### 3/4  REVISAR Y COPIAR ROMS #####")
+        log("\n##### 3/4  REVISAR Y COPIAR ROMS + COMPROBAR DISCOS (CHD/HDD/IMG) #####")
         cmd_check(root, args, copy=True)
+        cmd_disks(root, args)
         log("\n##### 4/4  DESCARGAR LO QUE FALTA (torrents via Deluge) Y CONVERTIR CHD #####")
         args.skip_copy = True
+        args.skip_disks_scan = True
         try:
             failed += cmd_fetch(root, args) or 0
         finally:
             args.skip_copy = False
+            args.skip_disks_scan = False
     elif act == "torrents":
         cmd_torrents(root, args)
     elif act == "disks":
@@ -4142,8 +4156,8 @@ MENU = [
     ("2", "Actualizar DBs                (descarga lo de jd_update.list)", "update"),
     ("3", "Organizar MRA                 (_CORE, _A-Z, _DEBUT, _UPDATED...)", "organize"),
     ("4", "ROMs: revisar, copiar, reconstruir", [
-        ("1", "Revisar                (solo lee; genera JD_Check.log)", "check"),
-        ("2", "Revisar y COPIAR los zips que faltan desde la fuente", "copy"),
+        ("1", "Revisar                (ROMs + discos CHD/HDD/IMG; solo lee)", "check"),
+        ("2", "Revisar y COPIAR los zips que faltan (y comprobar discos)", "copy"),
         ("3", "Reconstruir zips solucionables (con lo que ya tienes)", "rebuild"),
         ("4", "Reescanear la fuente de ROMs (regenera jd_roms.db)", "rescan"),
     ]),
