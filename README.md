@@ -53,6 +53,8 @@ Ajusta `SOURCE_DIR` al inicio del script con la ruta de tus ROMs.
 
 **Torrents (solo planea, todavía no descarga):** pon los `.torrent` de Pleasuredome (MAME / HBMAME ROMs *merged*) en `jd_update/torrents/` y, opcionalmente, sus datfiles en `jd_update/dats/`. `python3 jd_update.py torrents` (opción `t`) calcula qué zips faltan y cuántos MB serían, sin bajar el torrent completo; con los datfiles resuelve el zip del padre cuando la MRA pide el de un clon. `torrents --find texto` busca cualquier archivo dentro de los torrents (útil para CHD). Resultado en `JD_Torrents.log`.
 
+**Discos (HDD / IMG / CHD), solo revisa:** `python3 jd_update.py disks` (opción `c`) lee los `<file ... path="*.hdd|*.img|*.chd">` de las MRA y dice cuáles existen en `games/<core>/`, cuáles tienen el CHD ya local (falta convertir), cuáles salen de un `.torrent` de CHDs (con tamaño) y cuáles no tienen fuente. Resultado en `JD_Discos.log` y `JD_Discos.json`. Todavía no descarga ni convierte.
+
 Para leer `JD_Check.log` sin salir de la terminal: opción `v` del menú, o `python3 jd_update.py log` (`--section N` muestra una sección, `--grep texto` busca en todo el log).
 
 Para traer de aquí el script y las listas (`jd_update.list`, `jd_exclude.list`) a tu NAS: opción `g` del menú, o `python3 jd_update.py github` (`github-lists` solo trae las listas). Muestra qué cambia, pide confirmación y guarda copia `.bak`.

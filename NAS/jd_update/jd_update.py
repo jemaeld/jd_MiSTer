@@ -1018,6 +1018,7 @@ RE_RBF = re.compile(r"<rbf\b[^>]*>\s*(.*?)\s*</rbf>", re.I | re.S)
 RE_SET = re.compile(r"<setname>\s*(.*?)\s*</setname>", re.I | re.S)
 RE_ROM = re.compile(r"<rom\b([^>]*?)(?:/>|>(.*?)</rom>)", re.I | re.S)
 RE_PART = re.compile(r"<part\b([^>]*?)/?>", re.I)
+RE_FILE = re.compile(r"<file\b([^>]*?)/?>", re.I)
 RE_DATED = re.compile(r"_(\d{6,8}[a-z]?)$", re.I)
 # ------------------------------------------------------------- PARSEO ----
 def attr(attrs, key):
@@ -1030,7 +1031,7 @@ def split_zips(value):
 
 
 def parse_mra(raw):
-    """-> dict(rbf, setname, zips[], roms[{index, zips[], parts[{name, crc, zips[]}]}]).
+    """-> dict(rbf, setname, zips[], roms[{index, zips[], parts[{name, crc, zips[]}]}], files[{root, path, index}]).
     Regex a proposito: varias MRA no son XML valido."""
     text = RE_COMMENT.sub("", raw.decode("utf-8", errors="replace"))  # los comentarios pueden nombrar tags
     m = RE_RBF.search(text)
@@ -1069,7 +1070,12 @@ def parse_mra(raw):
                 add_zip(n)
             parts.append({"name": name.strip(), "crc": crc or None, "zips": pz})
         roms.append({"index": index, "zips": rzips, "parts": parts})
-    return {"rbf": rbf, "setname": setname, "zips": zips, "roms": roms}
+    files = []
+    for fa in RE_FILE.findall(text):          # <file ... path="cojag/x.hdd"/>: discos (HDD/IMG/CHD)
+        fp = attr(fa, "path")
+        if fp:
+            files.append({"root": attr(fa, "root"), "path": fp.strip(), "index": attr(fa, "index")})
+    return {"rbf": rbf, "setname": setname, "zips": zips, "roms": roms, "files": files}
 
 
 def load_excludes(root, extra=()):
@@ -2262,6 +2268,8 @@ def cmd_log(root, args):
 TORRENTS_DIR = "torrents"      # junto al script: aqui van los .torrent
 DATS_DIR = "dats"              # junto al script: aqui van los datfiles (.zip / .dat / .xml)
 TORRENT_LOG = "JD_Torrents.log"
+DISKS_LOG = "JD_Discos.log"
+DISKS_JSON = "JD_Discos.json"
 
 
 def bdecode(data):
@@ -2624,6 +2632,165 @@ def cmd_torrents(root, args):
     log("(Esta version solo planea: todavia no descarga.)")
 
 
+# ====================================================================
+#  DISCOS (HDD / IMG / CHD): que MRA los piden, cuales faltan y donde van
+# ====================================================================
+DISK_EXTS = (".hdd", ".img", ".chd")
+CHD_LOCAL_DIRS = ["games/mame", "games/hbmame"]
+
+
+def mra_disks(e):
+    """Discos que declara una MRA con <file>: [(ruta relativa a la raiz, partes de la ruta)]."""
+    out = []
+    for f in e.get("files", []):
+        path = f["path"].replace("\\", "/").strip("/")
+        if not path.lower().endswith(DISK_EXTS):
+            continue
+        base = (f["root"] or "games").replace("\\", "/").strip("/")
+        parts = [x for x in (base + "/" + path).split("/") if x and x != "."]
+        if ".." in parts:
+            continue
+        out.append(parts)
+    return out
+
+
+def collect_disks(root, entries):
+    """Agrupa por archivo de destino. -> {clave en minusculas: dict(parts, rel, stem, ext, mras[], rbfs{}, cands[])}"""
+    disks = {}
+    for e in entries:
+        for parts in mra_disks(e):
+            key = "/".join(parts).lower()
+            d = disks.get(key)
+            if d is None:
+                stem, ext = os.path.splitext(parts[-1])
+                d = disks[key] = {"parts": parts, "rel": "/".join(parts), "stem": stem, "ext": ext.lower(),
+                                  "mras": [], "rbfs": set(), "cands": []}
+            d["mras"].append(rel(root, e["path"]))
+            if e["rbf"].strip():
+                d["rbfs"].add(rbf_basename(e["rbf"]))
+            # el CHD puede llamarse como el disco o como el set padre (zip) de la MRA
+            for c in [d["stem"]] + [os.path.splitext(z)[0] for z in e["zips"]]:
+                if c and c.lower() not in [x.lower() for x in d["cands"]]:
+                    d["cands"].append(c)
+    return disks
+
+
+def find_local_chd(root, d):
+    """CHD ya presente (junto al destino o en games/mame|hbmame, suelto o en carpeta del juego)."""
+    folders = [d["parts"][:-1]] + [x.split("/") for x in CHD_LOCAL_DIRS]
+    for c in d["cands"]:
+        for fo in folders:
+            for sub in ([], [c]):
+                p = find_ci(root, fo + sub + [c + ".chd"])
+                if p is not None and p.is_file():
+                    return p
+    return None
+
+
+def cmd_disks(root, args):
+    """Revisa que discos (.hdd/.img/.chd) piden las MRA, cuales faltan en games/ y de donde saldrian.
+    Solo lee: no descarga ni convierte. Escribe JD_Discos.log y JD_Discos.json."""
+    _ls_cache.clear()
+    problems = []
+    entries = scan_mras(root, list(args.scan or CHECK_SCAN), problems)
+    if not entries:
+        sys.exit(f"No encontre ninguna .mra en: {', '.join(args.scan or CHECK_SCAN)}")
+    disks = collect_disks(root, entries)
+    log(f"MRAs unicas: {len(entries)} | discos distintos que piden: {len(disks)}")
+    if not disks:
+        log("Ninguna MRA pide discos (<file ... .hdd/.img/.chd>).")
+        return
+    tdir = STATE_DIR / TORRENTS_DIR
+    torrents, tidx, terrors = index_torrents(tdir)
+    items = []
+    for key in sorted(disks):
+        d = disks[key]
+        dest = find_ci(root, d["parts"])
+        it = {"dest": d["rel"], "core_dir": "/".join(d["parts"][:2]) if len(d["parts"]) > 2 else "/".join(d["parts"][:-1]),
+              "ext": d["ext"], "rbfs": sorted(d["rbfs"]), "mras": d["mras"], "chd_name": None, "chd_local": None,
+              "torrent": None, "size": 0, "exists": False}
+        if dest is not None and dest.is_file() and dest.stat().st_size > 0:
+            it["exists"] = True
+            it["size"] = dest.stat().st_size
+            it["status"] = "OK"
+        else:
+            it["convert"] = d["ext"] != ".chd"
+            local = find_local_chd(root, d)
+            if local is not None:
+                it["chd_local"] = rel(root, local)
+                it["chd_name"] = local.name
+                it["status"] = "CONVERTIR" if it["convert"] else "COPIAR"
+            else:
+                hit = None
+                for c in d["cands"]:
+                    rows = tidx.get(c.lower() + ".chd", [])
+                    rows = sorted(rows, key=lambda tf: tf[1]["path"].split("/")[-2:-1] != [c])  # prefiere carpeta del juego
+                    if rows:
+                        hit = (c, rows[0])
+                        break
+                if hit:
+                    c, (t, f) = hit
+                    it["chd_name"] = c + ".chd"
+                    it["torrent"] = {"file": t["file"], "path": f["path"], "size": f["size"], "index": f["index"]}
+                    it["size"] = f["size"]
+                    it["status"] = "BAJAR"
+                else:
+                    it["chd_name"] = d["cands"][0] + ".chd" if d["cands"] else None
+                    it["status"] = "SIN FUENTE" if torrents else "SIN TORRENT CARGADO"
+        items.append(it)
+
+    order = {"OK": 5, "COPIAR": 1, "CONVERTIR": 1, "BAJAR": 2, "SIN FUENTE": 0, "SIN TORRENT CARGADO": 0}
+    L = [f"===== DISCOS (HDD / IMG / CHD) =====   {datetime.now():%Y-%m-%d %H:%M:%S}",
+         f"Raiz: {root}", f"MRAs unicas: {len(entries)} | discos distintos: {len(items)}",
+         f"Torrents cargados: {len(torrents)} ({tdir})", ""]
+    cnt = Counter(i["status"] for i in items)
+    L.append("Resumen: " + " | ".join(f"{k}: {v}" for k, v in sorted(cnt.items(), key=lambda kv: order.get(kv[0], 9))))
+    by = defaultdict(list)
+    for i in items:
+        by[i["core_dir"]].append(i)
+    L += ["", "--- Por carpeta de core (games/<core>) ---"]
+    for cd in sorted(by):
+        c = Counter(i["status"] for i in by[cd])
+        L.append(f"  {cd:<28} " + ", ".join(f"{k} {v}" for k, v in sorted(c.items(), key=lambda kv: order.get(kv[0], 9))))
+    tb = {(i["torrent"]["file"], i["torrent"]["path"]): i["torrent"]["size"] for i in items if i["status"] == "BAJAR"}
+    if tb:
+        L += ["", f"A bajar de torrents: {len(tb)} CHD, {fmt_size(sum(tb.values()))}"]
+    n_head = len(L)
+    for st in ("SIN FUENTE", "SIN TORRENT CARGADO", "BAJAR", "CONVERTIR", "COPIAR", "OK"):
+        sel = [i for i in items if i["status"] == st]
+        if not sel:
+            continue
+        L += ["", f"=== {st} ({len(sel)}) ==="]
+        for i in sel:
+            L.append(f"{i['dest']}   [core: {', '.join(i['rbfs']) or '?'}]")
+            L.append(f"    MRA: {i['mras'][0]}" + (f"  (+{len(i['mras']) - 1} mas)" if len(i["mras"]) > 1 else ""))
+            if st == "OK":
+                L.append(f"    tamano: {fmt_size(i['size'])}")
+                continue
+            if i["chd_name"]:
+                L.append(f"    CHD de origen: {i['chd_name']}")
+            if i["chd_local"]:
+                L.append(f"    CHD ya local: {i['chd_local']}  -> falta " + ("convertir a " + i["ext"] if i["convert"] else "copiarlo"))
+            if i["torrent"]:
+                t = i["torrent"]
+                L.append(f"    torrent: [{t['file']}] {t['path']}  {fmt_size(t['size'])}  (indice {t['index']})")
+            if st.startswith("SIN"):
+                L.append("    (revisa el nombre con:  python3 jd_update.py torrents --find " + (i["chd_name"] or i["dest"]).rsplit(".", 1)[0] + ")")
+    try:
+        (STATE_DIR / DISKS_LOG).write_text("\n".join(L) + "\n", encoding="utf-8")
+        (STATE_DIR / DISKS_JSON).write_text(json.dumps(items, indent=1, ensure_ascii=False), encoding="utf-8")
+    except OSError as ex:
+        log(f"[!] no se pudo escribir el reporte: {ex}")
+    for n, why in terrors:
+        log(f"[!] {n}: {why}")
+    log("")
+    log("\n".join(L[4:n_head]))
+    log(f"\nDetalle: {STATE_DIR / DISKS_LOG}   (datos para el siguiente paso: {DISKS_JSON})")
+    if not torrents:
+        log(f"Aviso: no hay .torrent en {tdir}; pon ahi el de MAME CHDs para saber cuales bajar.")
+    log("(Solo revisa: todavia no descarga ni convierte.)")
+
+
 def cmd_organize(root, args):
     mode = args.mode
     scan_dirs = list(args.scan or DEFAULT_SCAN)
@@ -2716,6 +2883,8 @@ def run_action(act, root, args):
         cmd_check(root, args, copy=True)
     elif act == "torrents":
         cmd_torrents(root, args)
+    elif act == "disks":
+        cmd_disks(root, args)
     elif act == "log":
         cmd_log(root, args)
     elif act == "github":
@@ -2729,7 +2898,7 @@ def run_action(act, root, args):
     return failed
 
 
-ACCIONES = ["update", "organize", "check", "copy", "rebuild", "rescan", "all", "torrents", "log", "github", "github-lists",
+ACCIONES = ["update", "organize", "check", "copy", "rebuild", "rescan", "all", "torrents", "disks", "log", "github", "github-lists",
             "undo-organize", "undo-rebuild"]
 MENU_ITEMS = [
     ("1", "update", "Actualizar               (descarga las DBs de jd_update.list)"),
@@ -2742,6 +2911,7 @@ MENU_ITEMS = [
     ("8", "undo-organize", "Deshacer el organizador"),
     ("9", "undo-rebuild", "Deshacer los zips creados por la opcion 5"),
     ("t", "torrents", "Torrents: planear que bajar de los .torrent (solo planea; --find para buscar)"),
+    ("c", "disks", "Discos: que MRA piden HDD/IMG/CHD, cuales faltan y de donde saldrian (solo revisa)"),
     ("v", "log", "Ver el log (JD_Check.log) aqui: secciones, busqueda"),
     ("g", "github", "Actualizar el script y las listas desde GitHub"),
     ("l", "github-lists", "Actualizar solo las listas (jd_update.list, jd_exclude.list) desde GitHub"),
