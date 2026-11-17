@@ -2270,6 +2270,8 @@ DATS_DIR = "dats"              # junto al script: aqui van los datfiles (.zip / 
 TORRENT_LOG = "JD_Torrents.log"
 DISKS_LOG = "JD_Discos.log"
 DISKS_JSON = "JD_Discos.json"
+MAGNETS_FILE = "magnets.list"
+DELUGE_CONF = "jd_deluge.ini"
 
 
 def bdecode(data):
@@ -2791,6 +2793,224 @@ def cmd_disks(root, args):
     log("(Solo revisa: todavia no descarga ni convierte.)")
 
 
+# ====================================================================
+#  MAGNETS -> .torrent (pide solo los METADATOS a tu Deluge; no descarga datos)
+# ====================================================================
+DELUGE_TEMPLATE = """[deluge]
+# URL del Web UI de Deluge (con o sin /json al final)
+url = {url}
+# contrasena del Web UI
+password = {password}
+# solo si tu Web UI esta detras de usuario/contrasena HTTP (basic auth); si no, dejalos vacios
+http_user =
+http_pass =
+# pon no si el certificado HTTPS es autofirmado
+verify_ssl = yes
+# segundos que Deluge espera los metadatos de cada magnet
+timeout = 120
+"""
+
+
+def parse_magnet(uri):
+    """-> dict(uri, infohash, name, size) o None."""
+    import base64 as b64
+    from urllib.parse import urlparse, parse_qs
+    uri = uri.strip()
+    if not uri.lower().startswith("magnet:"):
+        return None
+    q = parse_qs(urlparse(uri).query)
+    for xt in q.get("xt", []):
+        if xt.lower().startswith("urn:btih:"):
+            h = xt[9:].strip()
+            if re.fullmatch(r"[0-9a-fA-F]{40}", h):
+                h = h.lower()
+            elif re.fullmatch(r"[A-Za-z2-7]{32}", h):
+                h = b64.b32decode(h.upper()).hex()
+            else:
+                return None
+            try:
+                size = int(q.get("xl", ["0"])[0])
+            except ValueError:
+                size = 0
+            return {"uri": uri, "infohash": h, "name": q.get("dn", [""])[0], "size": size}
+    return None
+
+
+def read_magnets(path):
+    """-> (magnets[], errores[]). Una por linea; admite lineas vacias y # comentarios."""
+    mags, errs, seen = [], [], set()
+    for n, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = parse_magnet(line)
+        if m is None:
+            errs.append(f"linea {n}: no es un magnet valido")
+        elif m["infohash"] not in seen:
+            seen.add(m["infohash"])
+            mags.append(m)
+    return mags, errs
+
+
+class DelugeWeb:
+    """Cliente minimo del JSON-RPC del Web UI de Deluge 2.x."""
+
+    def __init__(self, url, password, http_user="", http_pass="", verify=True, timeout=120):
+        import http.cookiejar
+        import ssl
+        import base64 as b64
+        url = url.strip().rstrip("/")
+        self.url = url if url.lower().endswith("/json") else url + "/json"
+        self.password, self.timeout, self._id = password, timeout, 0
+        handlers = [urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())]
+        if not verify:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            handlers.append(urllib.request.HTTPSHandler(context=ctx))
+        self.opener = urllib.request.build_opener(*handlers)
+        self.headers = {"Content-Type": "application/json", "User-Agent": UA}
+        if http_user:
+            tok = b64.b64encode(f"{http_user}:{http_pass}".encode()).decode()
+            self.headers["Authorization"] = "Basic " + tok
+
+    def call(self, method, params=None, timeout=None):
+        self._id += 1
+        body = json.dumps({"method": method, "params": params or [], "id": self._id}).encode()
+        req = urllib.request.Request(self.url, data=body, headers=self.headers, method="POST")
+        try:
+            with self.opener.open(req, timeout=timeout or self.timeout) as r:
+                data = json.loads(r.read().decode("utf-8", errors="replace"))
+        except urllib.error.HTTPError as e:
+            hint = " (usuario/contrasena HTTP: revisa http_user/http_pass)" if e.code == 401 else ""
+            raise RuntimeError(f"HTTP {e.code} en {self.url}{hint}")
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            raise RuntimeError(f"no se pudo hablar con {self.url}: {getattr(e, 'reason', e)}")
+        if data.get("error"):
+            raise RuntimeError(f"{method}: {data['error'].get('message', data['error'])}")
+        return data.get("result")
+
+    def login(self):
+        if not self.call("auth.login", [self.password]):
+            raise RuntimeError("contrasena del Web UI incorrecta")
+        if not self.call("web.connected"):
+            hosts = self.call("web.get_hosts") or []
+            if not hosts:
+                raise RuntimeError("el Web UI no tiene ningun daemon configurado (Connection Manager)")
+            self.call("web.connect", [hosts[0][0]])
+
+    def magnet_metadata(self, uri, wait):
+        """Metadatos bencodeados (el diccionario 'info') del magnet, sin agregarlo a Deluge."""
+        import base64 as b64
+        res = self.call("core.prefetch_magnet_metadata", [uri, int(wait)], timeout=wait + 60)
+        if not res or len(res) < 2 or not res[1]:
+            raise RuntimeError("Deluge no devolvio metadatos (sin peers/seeds a tiempo; sube 'timeout' y reintenta)")
+        meta = res[1]
+        return b64.b64decode(meta if isinstance(meta, (str, bytes)) else str(meta))
+
+
+def load_deluge(args):
+    """Lee jd_deluge.ini (o lo pide una vez y lo guarda con permisos 600). Devuelve DelugeWeb o None."""
+    conf = STATE_DIR / DELUGE_CONF
+    cp = configparser.ConfigParser(interpolation=None)
+    if conf.is_file():
+        cp.read(conf, encoding="utf-8")
+    sec = cp["deluge"] if cp.has_section("deluge") else {}
+    url, pw = (sec.get("url", "") or "").strip(), sec.get("password", "") or ""
+    if not url or not pw or "TU_" in url:
+        if not sys.stdin.isatty():
+            if not conf.is_file():
+                conf.write_text(DELUGE_TEMPLATE.format(url="https://TU_SERVIDOR/deluge", password="TU_PASSWORD"), encoding="utf-8")
+            log(f"Falta configurar Deluge. Edita {conf} (url y password) y vuelve a correr.")
+            return None
+        import getpass
+        log(f"\nNo hay datos de Deluge. Se guardan en {conf} (permisos 600, solo en tu NAS; no va a GitHub).")
+        url = input("URL del Web UI de Deluge (ej. https://xxxx.appboxes.co/deluge): ").strip()
+        pw = getpass.getpass("Contrasena del Web UI (no se muestra): ")
+        if not url or not pw:
+            log("Cancelado.")
+            return None
+        if not args.dry_run:
+            conf.write_text(DELUGE_TEMPLATE.format(url=url, password=pw), encoding="utf-8")
+            try:
+                os.chmod(conf, 0o600)
+            except OSError:
+                pass
+        cp.read_string(DELUGE_TEMPLATE.format(url=url, password=pw))
+        sec = cp["deluge"]
+    try:
+        tmo = int((sec.get("timeout", "120") or "120").strip())
+    except ValueError:
+        tmo = 120
+    return DelugeWeb(url, pw, (sec.get("http_user", "") or "").strip(), sec.get("http_pass", "") or "",
+                     (sec.get("verify_ssl", "yes") or "yes").strip().lower() not in ("no", "false", "0"), tmo)
+
+
+def cmd_magnets(root, args):
+    """magnets.list -> torrents/*.torrent. Le pide a TU Deluge los metadatos (lista de archivos) de cada
+    magnet sin agregarlo ni bajar datos. Los que ya tienen .torrent (mismo infohash) se saltan."""
+    mf = STATE_DIR / MAGNETS_FILE
+    if not mf.is_file():
+        log(f"No existe {mf}. Crea ese archivo con un magnet por linea y vuelve a correr.")
+        return
+    mags, errs = read_magnets(mf)
+    for e in errs:
+        log(f"[!] {MAGNETS_FILE}: {e}")
+    if not mags:
+        log("No hay magnets validos.")
+        return
+    tdir = STATE_DIR / TORRENTS_DIR
+    have = {t["infohash"]: t for t in index_torrents(tdir)[0]}
+    todo = [m for m in mags if m["infohash"] not in have]
+    log(f"Magnets: {len(mags)} | ya tienen .torrent: {len(mags) - len(todo)} | por obtener: {len(todo)}")
+    for m in mags:
+        mark = "ya tiene .torrent" if m["infohash"] in have else "por obtener"
+        log(f"  - {m['name'] or m['infohash']}  ({fmt_size(m['size']) if m['size'] else '?'})  [{mark}]")
+    if not todo:
+        return
+    if args.dry_run:
+        log("[DRY-RUN] no se contacta a Deluge.")
+        return
+    cli = load_deluge(args)
+    if cli is None:
+        return
+    try:
+        cli.login()
+    except RuntimeError as e:
+        log(f"[!] Deluge: {e}")
+        return
+    tdir.mkdir(exist_ok=True)
+    ok = 0
+    for m in todo:
+        label = m["name"] or m["infohash"]
+        log(f"\nPidiendo metadatos de: {label} (puede tardar hasta {cli.timeout}s)...")
+        try:
+            meta = cli.magnet_metadata(m["uri"], cli.timeout)
+        except RuntimeError as e:
+            log(f"[!] {label}: {e}")
+            continue
+        if hashlib.sha1(meta).hexdigest() != m["infohash"]:
+            log(f"[!] {label}: los metadatos recibidos NO coinciden con el hash del magnet; se descartan.")
+            continue
+        fname = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", label).strip(" .") or m["infohash"]
+        dest = tdir / (fname + ".torrent")
+        tmp = dest.with_name(dest.name + ".part")
+        tmp.write_bytes(b"d4:info" + meta + b"e")
+        try:
+            t = read_torrent(tmp)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError) as e:
+            tmp.unlink()
+            log(f"[!] {label}: metadatos ilegibles ({e})")
+            continue
+        os.replace(tmp, dest)
+        ok += 1
+        extra = ""
+        if m["size"] and abs(t["total"] - m["size"]) > max(1024 * 1024, m["size"] // 100):
+            extra = f"  [aviso: el magnet decia {fmt_size(m['size'])}]"
+        log(f"  OK {dest.name}: {len(t['files'])} archivos, {fmt_size(t['total'])}{extra}")
+    log(f"\nTorrents obtenidos: {ok} de {len(todo)}. Siguiente: opcion c (discos) o t (zips).")
+
+
 def cmd_organize(root, args):
     mode = args.mode
     scan_dirs = list(args.scan or DEFAULT_SCAN)
@@ -2885,6 +3105,8 @@ def run_action(act, root, args):
         cmd_torrents(root, args)
     elif act == "disks":
         cmd_disks(root, args)
+    elif act == "magnets":
+        cmd_magnets(root, args)
     elif act == "log":
         cmd_log(root, args)
     elif act == "github":
@@ -2898,7 +3120,7 @@ def run_action(act, root, args):
     return failed
 
 
-ACCIONES = ["update", "organize", "check", "copy", "rebuild", "rescan", "all", "torrents", "disks", "log", "github", "github-lists",
+ACCIONES = ["update", "organize", "check", "copy", "rebuild", "rescan", "all", "torrents", "magnets", "disks", "log", "github", "github-lists",
             "undo-organize", "undo-rebuild"]
 MENU_ITEMS = [
     ("1", "update", "Actualizar               (descarga las DBs de jd_update.list)"),
@@ -2911,6 +3133,7 @@ MENU_ITEMS = [
     ("8", "undo-organize", "Deshacer el organizador"),
     ("9", "undo-rebuild", "Deshacer los zips creados por la opcion 5"),
     ("t", "torrents", "Torrents: planear que bajar de los .torrent (solo planea; --find para buscar)"),
+    ("m", "magnets", "Magnets: convertir magnets.list en .torrent usando tu Deluge (solo metadatos)"),
     ("c", "disks", "Discos: que MRA piden HDD/IMG/CHD, cuales faltan y de donde saldrian (solo revisa)"),
     ("v", "log", "Ver el log (JD_Check.log) aqui: secciones, busqueda"),
     ("g", "github", "Actualizar el script y las listas desde GitHub"),
