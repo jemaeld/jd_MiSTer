@@ -1019,7 +1019,7 @@ RE_SET = re.compile(r"<setname>\s*(.*?)\s*</setname>", re.I | re.S)
 RE_ROM = re.compile(r"<rom\b([^>]*?)(?:/>|>(.*?)</rom>)", re.I | re.S)
 RE_PART = re.compile(r"<part\b([^>]*?)/?>", re.I)
 RE_FILE = re.compile(r"<file\b([^>]*?)/?>", re.I)
-RE_DISKWORD = re.compile(r"(?<![\w.\-])([\w][\w.\-]*\.(?:chd|hdd|img))(?![\w])", re.I)
+RE_DISKWORD = re.compile(r"(?<![\w.\-])((?:[\w][\w.\-]* ){0,2}[\w][\w.\-]*\.(?:chd|hdd|img))(?![\w])", re.I)
 RE_DATED = re.compile(r"_(\d{6,8}[a-z]?)$", re.I)
 # ------------------------------------------------------------- PARSEO ----
 def attr(attrs, key):
@@ -1035,11 +1035,18 @@ def parse_mra(raw):
     """-> dict(rbf, setname, zips[], roms[{index, zips[], parts[{name, crc, zips[]}]}], files[{root, path, index}]).
     Regex a proposito: varias MRA no son XML valido."""
     full = raw.decode("utf-8", errors="replace")
-    cdisks = []
+    cdisks, cforms = [], {}
     for cm in RE_COMMENT.findall(full):            # discos que la MRA solo menciona en comentarios (ranuras del OSD)
-        for w in RE_DISKWORD.findall(cm):
+        for fullname in RE_DISKWORD.findall(cm):
+            toks = fullname.split(" ")
+            w = toks[-1]
             if w.lower() not in [x.lower() for x in cdisks]:
                 cdisks.append(w)
+            lst = cforms.setdefault(w.lower(), [])      # formas con palabras previas: "gq974-ja c01.chd" (nombres con espacios)
+            for i in range(len(toks) - 1):
+                f = " ".join(toks[i:])
+                if f.lower() not in [x.lower() for x in lst]:
+                    lst.append(f)
     text = RE_COMMENT.sub("", full)  # los comentarios pueden nombrar tags
     m = RE_RBF.search(text)
     rbf = m.group(1) if m else ""
@@ -1082,7 +1089,7 @@ def parse_mra(raw):
         fp = attr(fa, "path")
         if fp:
             files.append({"root": attr(fa, "root"), "path": fp.strip(), "index": attr(fa, "index")})
-    return {"rbf": rbf, "setname": setname, "zips": zips, "roms": roms, "files": files, "cdisks": cdisks}
+    return {"rbf": rbf, "setname": setname, "zips": zips, "roms": roms, "files": files, "cdisks": cdisks, "cforms": cforms}
 
 
 def load_excludes(root, extra=()):
@@ -2839,7 +2846,8 @@ def cmd_disks(root, args):
                     it["status"] = "SIN FUENTE" if torrents else "SIN TORRENT CARGADO"
         items.append(it)
 
-    # ---- OSD: nombres citados en comentarios (se agrupa por nombre sin extension: x.chd + x.hdd = un disco) ----
+    # ---- OSD: nombres citados en comentarios. Se resuelve CADA nombre con el contexto de su MRA (los CHD pueden
+    #      llevar espacios: "gq974-ja c01.chd") y se agrupa por el CHD resuelto (x.chd + x.hdd = un disco) ----
     chd_folders = defaultdict(list)                   # carpeta del juego (minusculas) -> [(torrent, archivo)]
     for t in torrents:
         for f in t["files"]:
@@ -2847,20 +2855,30 @@ def cmd_disks(root, args):
                 chd_folders[f["path"].split("/")[-2].lower()].append((t, f))
     osd = {}
     for e in entries:
+        cf = e.get("cforms", {})
+        sets = set_names(e)
         for w in e.get("cdisks", []):
-            stem = os.path.splitext(w)[0]
-            if stem.lower() in fixed_stems:
+            plain_stem = os.path.splitext(w)[0]
+            if plain_stem.lower() in fixed_stems:
                 continue
-            o = osd.setdefault(stem.lower(), {"stem": stem, "names": [], "mras": [], "rbfs": set(), "sets": []})
+            hit, used = None, plain_stem
+            for fm in cf.get(w.lower(), []) + [w]:        # primero la forma mas larga
+                fs = os.path.splitext(fm)[0]
+                r = tor_row(fs + ".chd", sets)
+                if r:
+                    hit, used = r, fs
+                    break
+            key = ("t", hit[1]["path"]) if hit else ("n", plain_stem.lower())
+            o = osd.setdefault(key, {"stem": used, "names": [], "mras": [], "rbfs": set(), "sets": [], "hit": hit})
             if w.lower() not in [x.lower() for x in o["names"]]:
                 o["names"].append(w)
             o["mras"].append(rel(root, e["path"]))
             if e["rbf"].strip():
                 o["rbfs"].add(rbf_basename(e["rbf"]))
-            for c in set_names(e):
+            for c in sets:
                 if c.lower() not in [x.lower() for x in o["sets"]]:
                     o["sets"].append(c)
-    for k in sorted(osd):
+    for k in sorted(osd, key=lambda k: (k[1].lower(), k[0])):
         o = osd[k]
         chd = o["stem"] + ".chd"
         raw = [n for n in o["names"] if not n.lower().endswith(".chd")]     # la MRA pide el .hdd/.img convertido
@@ -2875,26 +2893,26 @@ def cmd_disks(root, args):
             it.update(chd_local=rel(root, have), status="LOCAL", size=have.stat().st_size)
         elif have_chd is not None:
             it.update(chd_local=rel(root, have_chd), status="CONVERTIR", size=have_chd.stat().st_size)
+        elif o["hit"]:
+            t, f = o["hit"]
+            it.update(status="BAJAR", size=f["size"], chd_name=f["path"].rsplit("/", 1)[-1],
+                      torrent={"file": t["file"], "path": f["path"], "size": f["size"], "index": f["index"]})
         else:
-            r = tor_row(chd, o["sets"])
-            if r:
-                t, f = r
-                it.update(status="BAJAR", size=f["size"],
-                          torrent={"file": t["file"], "path": f["path"], "size": f["size"], "index": f["index"]})
-            else:
-                it["status"] = "SIN FUENTE" if torrents else "SIN TORRENT CARGADO"
-                near = []                              # CHD de la carpeta del set cuyo nombre empieza igual
-                for c in o["sets"]:
-                    near += [x for x in chd_folders.get(c.lower(), [])]
-                pref = [x for x in near if x[1]["path"].rsplit("/", 1)[-1].lower().startswith(o["stem"].lower())]
-                cand = pref or near
-                if cand:
-                    it["candidatos"] = [{"file": t["file"], "path": f["path"], "size": f["size"], "index": f["index"]}
-                                        for t, f in cand[:12]]
-                    if len(pref) == 1:                 # un solo CHD empieza igual: casi seguro es ese
-                        t, f = pref[0]
-                        it.update(status="APROX", size=f["size"], chd_name=f["path"].rsplit("/", 1)[-1],
-                                  torrent={"file": t["file"], "path": f["path"], "size": f["size"], "index": f["index"]})
+            it["status"] = "SIN FUENTE" if torrents else "SIN TORRENT CARGADO"
+            near = []                                  # CHD de la carpeta del set cuyo nombre termina o empieza igual
+            for c in o["sets"]:
+                near += list(chd_folders.get(c.lower(), []))
+            sl = o["stem"].lower()
+            pref = [x for x in near if x[1]["path"].rsplit("/", 1)[-1].lower().startswith(sl)
+                    or x[1]["path"].rsplit("/", 1)[-1].lower().endswith(" " + sl + ".chd")]
+            cand = pref or near
+            if cand:
+                it["candidatos"] = [{"file": t["file"], "path": f["path"], "size": f["size"], "index": f["index"]}
+                                    for t, f in cand[:12]]
+                if len(pref) == 1:                     # un solo CHD coincide: casi seguro es ese
+                    t, f = pref[0]
+                    it.update(status="APROX", size=f["size"], chd_name=f["path"].rsplit("/", 1)[-1],
+                              torrent={"file": t["file"], "path": f["path"], "size": f["size"], "index": f["index"]})
         items.append(it)
 
     # ---- POSIBLE: CHD del set de MAME que la MRA no menciona ----
