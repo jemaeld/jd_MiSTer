@@ -88,3 +88,11 @@ Path in MiSTer, URL, Size in bytes (optional but recommended), MD5 Hash (optiona
 ## Cómo se genera la base de datos
 
 Cada push a `main` ejecuta el workflow `Build Custom Database`, que genera `db.json.zip` en la rama `db`. Basado en la plantilla [Downloader_DB-Template_MiSTer](https://github.com/theypsilon/Downloader_DB-Template_MiSTer).
+
+## Descargar y convertir (menu 5 -> 5)
+
+`python3 jd_update.py fetch` (o menu **5 > 5**) hace todo en una pasada: copia lo local, y los zips de ROMs y CHD que faltan los
+baja de los torrents usando **tu Deluge** (agrega el torrent solo con esos archivos, etiqueta `mister`), los trae por **FTP**
+del Appbox, verifica zips/CHD, convierte los CHD a `.hdd`/`.img` con `chdman` (local o Docker) comprobando el SHA1 del CHD,
+y coloca cada archivo en su destino. Opciones: `--fetch-only zips|disks`, `--no-convert`, `--dry-run`.
+Datos FTP en `jd_deluge.ini` (seccion `[ftp]`, solo en tu NAS). Log: `JD_Fetch.log`.

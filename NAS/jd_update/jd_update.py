@@ -53,6 +53,7 @@ import os
 import platform
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -2600,6 +2601,30 @@ def find_in_torrents(torrents, text, limit=150):
     return out
 
 
+def zip_plan(root, args, R, torrents, tidx):
+    """Cruza lo que falta (R) con datfiles y torrents. -> (plan, dats, dat_errors)."""
+    ddir = STATE_DIR / DATS_DIR
+    dats =[p for p in sorted(ddir.glob("*")) if p.suffix.lower() in (".zip", ".dat", ".xml")
+            and "chd" not in p.name.lower()] if ddir.is_dir() else []
+
+    parts = missing_parts(R)
+    wanted = {p["crc"] for _e, _r, p, _d in parts if p["crc"] is not None}
+    dat_entries, dat_errors = {}, []
+    if dats and wanted:
+        for p in dats:
+            log(f"Leyendo datfile {p.name} (puede tardar un poco)...")
+            try:
+                hits, clone = read_dat(p, wanted)
+            except Exception as e:  # noqa
+                dat_errors.append((p.name, f"no se pudo leer ({e})"))
+                log(f"[!] {p.name}: {e}")
+                continue
+            dat_entries.setdefault(kind_of(p.name), []).append((hits, clone))
+    local_idx = load_roms_db(Path(args.source).expanduser(), STATE_DIR / ROMS_DB, False, create=False)
+    plan = plan_torrents(root, R, args, tidx, dat_entries, local_idx)
+    return plan, dats, dat_errors, parts
+
+
 def cmd_torrents(root, args):
     """Lee los .torrent (torrents/) y los datfiles (dats/), cruza con lo que faltan las MRA y muestra
     exactamente que zips y cuantos MB habria que bajar. NO descarga nada."""
@@ -2617,26 +2642,9 @@ def cmd_torrents(root, args):
     if args.find:
         print("\n".join(find_in_torrents(torrents, args.find)))
         return
-    dats =[p for p in sorted(ddir.glob("*")) if p.suffix.lower() in (".zip", ".dat", ".xml")
-            and "chd" not in p.name.lower()] if ddir.is_dir() else []
-
     excl = prepare_excludes(root, args)
     R = analyze(root, args, excl)
-    parts = missing_parts(R)
-    wanted = {p["crc"] for _e, _r, p, _d in parts if p["crc"] is not None}
-    dat_entries, dat_errors = {}, []
-    if dats and wanted:
-        for p in dats:
-            log(f"Leyendo datfile {p.name} (puede tardar un poco)...")
-            try:
-                hits, clone = read_dat(p, wanted)
-            except Exception as e:  # noqa
-                dat_errors.append((p.name, f"no se pudo leer ({e})"))
-                log(f"[!] {p.name}: {e}")
-                continue
-            dat_entries.setdefault(kind_of(p.name), []).append((hits, clone))
-    local_idx = load_roms_db(Path(args.source).expanduser(), STATE_DIR / ROMS_DB, False, create=False)
-    plan = plan_torrents(root, R, args, tidx, dat_entries, local_idx)
+    plan, dats, dat_errors, parts = zip_plan(root, args, R, torrents, tidx)
     L = render_plan(torrents, dats, plan, terrors, dat_errors)
     try:
         (STATE_DIR / TORRENT_LOG).write_text("\n".join(L) + "\n", encoding="utf-8")
@@ -3315,6 +3323,697 @@ def cmd_magnets(root, args):
             log(f"[!] No se pudo poner la etiqueta '{cli.label}': {e}")
 
 
+# ====================================================================
+#  DESCARGA SELECTIVA (Deluge del Appbox -> FTP -> tu NAS) + CONVERSION DE CHD
+# ====================================================================
+FETCH_LOG = "JD_Fetch.log"
+FETCH_TMP = ".fetch"
+POLL_SECS = 20
+DOCKER_IMAGE = "jd-chdman"
+DOCKERFILE = ("FROM debian:stable-slim\n"
+              "RUN apt-get update && apt-get install -y --no-install-recommends mame-tools "
+              "&& rm -rf /var/lib/apt/lists/*\n")
+FTP_TEMPLATE = """
+[ftp]
+# FTP de tu Appbox (para traer los archivos que Deluge ya bajo)
+host = {host}
+port = {port}
+user = {user}
+password = {password}
+# auto = intenta FTP con TLS y si no se puede usa FTP normal; tambien: yes / no
+tls = auto
+# ruta remota equivalente a la carpeta de descargas de Deluge; vacio = se detecta sola
+base =
+# si pones yes, borra del Appbox cada archivo YA traido y verificado (cuidado si ahi tienes el set completo)
+remote_cleanup = no
+# si pones yes, conserva el .chd descargado junto al .hdd/.img convertido
+keep_chd = no
+"""
+
+
+def flog(msg=""):
+    log(msg)
+    try:
+        with open(STATE_DIR / FETCH_LOG, "a", encoding="utf-8") as fh:
+            fh.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {msg}\n")
+    except OSError:
+        pass
+
+
+def chd_header(path):
+    """Cabecera de un CHD v5: dict(logical, rawsha1, sha1) o {'version': n} si es otra version; None si no es CHD."""
+    try:
+        with open(path, "rb") as fh:
+            h = fh.read(124)
+    except OSError:
+        return None
+    if len(h) < 16 or h[:8] != b"MComprHD":
+        return None
+    ver = struct.unpack(">I", h[12:16])[0]
+    if ver != 5 or len(h) < 124:
+        return {"version": ver}
+    return {"version": 5, "logical": struct.unpack(">Q", h[32:40])[0], "rawsha1": h[64:84].hex(), "sha1": h[84:104].hex()}
+
+
+def sha1_file(path, chunk=8 << 20):
+    h = hashlib.sha1()
+    with open(path, "rb") as fh:
+        while True:
+            b = fh.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def torrent_with_trackers(tpath, trackers):
+    """Reempaqueta un .torrent (solo 'info') agregandole los trackers del magnet. -> bytes."""
+    data = Path(tpath).read_bytes()
+    _meta, span = bdecode(data)
+    info = data[span[0]:span[1]]
+    out = b"d"
+    if trackers:
+        out += b"13:announce-listl" + b"".join(b"l%d:%se" % (len(u.encode()), u.encode()) for u in trackers) + b"e"
+    return out + b"4:info" + info + b"e"
+
+
+class Chdman:
+    """Convierte CHD -> .hdd/.img con chdman: local (en el PATH o jd_update/chdman) o por Docker."""
+
+    def __init__(self):
+        self.bin = None
+        self.docker = None
+        self.why = ""
+
+    def detect(self):
+        local = shutil.which("chdman")
+        mine = STATE_DIR / "chdman"
+        if not local and mine.is_file():
+            try:
+                os.chmod(mine, 0o755)
+            except OSError:
+                pass
+            local = str(mine)
+        if local:
+            self.bin = local
+            return True
+        if not shutil.which("docker"):
+            self.why = ("no hay chdman ni Docker. Opciones: instala Container Manager (Docker) en el NAS, o copia un "
+                        f"binario de chdman a {mine}")
+            return False
+        for dk in (["docker"], ["sudo", "-n", "docker"]):
+            try:
+                r = subprocess.run(dk + ["info"], capture_output=True, timeout=60)
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if r.returncode == 0:
+                self.docker = dk
+                break
+        if not self.docker:
+            self.why = ("Docker existe pero este usuario no puede usarlo. Una sola vez, en el NAS: "
+                        "sudo synogroup --add docker $USER  (y vuelve a abrir la sesion SSH), o corre el script con sudo")
+            return False
+        r = subprocess.run(self.docker + ["image", "inspect", DOCKER_IMAGE], capture_output=True)
+        if r.returncode != 0:
+            flog("Construyendo la imagen de chdman (una sola vez; necesita internet y tarda unos minutos)...")
+            r = subprocess.run(self.docker + ["build", "-t", DOCKER_IMAGE, "-"], input=DOCKERFILE.encode(),
+                               capture_output=True)
+            if r.returncode != 0:
+                self.docker = None
+                self.why = "no se pudo construir la imagen de Docker: " + r.stderr.decode(errors="replace")[-400:]
+                return False
+        return True
+
+    def extract(self, chd, out):
+        """CHD de disco duro -> imagen cruda. `chd` y `out` deben estar en la MISMA carpeta."""
+        chd, out = Path(chd), Path(out)
+        if self.bin:
+            cmd = [self.bin, "extracthd", "-i", str(chd), "-o", str(out)]
+        else:
+            cmd = self.docker + ["run", "--rm", "-u", f"{os.getuid()}:{os.getgid()}", "-v", f"{chd.parent}:/work",
+                                 DOCKER_IMAGE, "chdman", "extracthd", "-i", f"/work/{chd.name}", "-o", f"/work/{out.name}"]
+        r = subprocess.run(cmd, capture_output=True)
+        if r.returncode != 0 or not out.is_file():
+            tail = (r.stderr or r.stdout).decode(errors="replace").strip().splitlines()[-3:]
+            raise RuntimeError("chdman fallo: " + " | ".join(tail))
+
+
+def convert_chd(tool, chd, out_final, keep_chd_at=None):
+    """Convierte y VERIFICA contra el SHA1 de datos de la cabecera del CHD. out_final: Path destino."""
+    chd, out_final = Path(chd), Path(out_final)
+    hdr = chd_header(chd)
+    if hdr is None:
+        raise RuntimeError("no es un CHD valido")
+    if hdr.get("logical"):
+        free = shutil.disk_usage(chd.parent).free
+        if free < hdr["logical"] + (200 << 20):
+            raise RuntimeError(f"falta espacio: la imagen pesara {fmt_size(hdr['logical'])} y hay {fmt_size(free)} libres")
+    tmp = chd.with_name(out_final.name + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+    tool.extract(chd, tmp)
+    if hdr.get("rawsha1"):
+        got = sha1_file(tmp)
+        if got != hdr["rawsha1"]:
+            tmp.unlink()
+            raise RuntimeError(f"la imagen no coincide con el SHA1 del CHD ({got[:10]} != {hdr['rawsha1'][:10]})")
+        note = "SHA1 verificado"
+    else:
+        note = f"sin verificar (CHD version {hdr.get('version')})"
+    out_final.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(tmp), str(out_final))
+    return f"{out_final.name} ({fmt_size(out_final.stat().st_size)}, {note})"
+
+
+class FtpFetch:
+    def __init__(self, cfg):
+        self.cfg, self.ftp, self.prefix = cfg, None, {}
+
+    def connect(self):
+        import ftplib
+        host, port = self.cfg["host"], int(self.cfg.get("port") or 21)
+        tls = (self.cfg.get("tls") or "auto").lower()
+        last = None
+        for use_tls in ([True, False] if tls == "auto" else [tls in ("yes", "true", "1")]):
+            try:
+                f = ftplib.FTP_TLS(timeout=60) if use_tls else ftplib.FTP(timeout=60)
+                f.connect(host, port)
+                f.login(self.cfg["user"], self.cfg["password"])
+                if use_tls:
+                    f.prot_p()
+                f.set_pasv(True)
+                f.voidcmd("TYPE I")
+                self.ftp = f
+                return
+            except (OSError, ftplib.Error) as e:
+                last = e
+        raise RuntimeError(f"no se pudo conectar al FTP {host}:{port}: {last}")
+
+    def alive(self):
+        try:
+            self.ftp.voidcmd("NOOP")
+            return True
+        except Exception:  # noqa
+            return False
+
+    def ensure(self):
+        if self.ftp is None or not self.alive():
+            self.connect()
+
+    def _size(self, path):
+        import ftplib
+        try:
+            return self.ftp.size(path)
+        except ftplib.Error:
+            return None
+
+    def locate(self, save_path, rel, size):
+        """Ruta REMOTA del archivo: save_path de Deluge + ruta dentro del torrent, quitando carpetas del principio
+        hasta que el FTP la reconozca (el FTP suele estar 'enjaulado' en una carpeta)."""
+        self.ensure()
+        base = (self.cfg.get("base") or "").strip().rstrip("/")
+        if base:
+            p = base + "/" + rel
+            if self._size(p) == size:
+                return p
+        parts = [x for x in (save_path or "").split("/") if x]
+        key = save_path
+        if key in self.prefix:
+            p = self.prefix[key] + "/" + rel
+            if self._size(p) == size:
+                return p
+        tried = []
+        for k in range(len(parts) + 1):
+            pre = "/".join(parts[k:])
+            for lead in ("/", ""):
+                p = lead + (pre + "/" if pre else "") + rel
+                tried.append(p)
+                if self._size(p) == size:
+                    self.prefix[key] = p[:-len(rel) - 1] if len(p) > len(rel) else ""
+                    return p
+        raise RuntimeError("no encuentro el archivo en el FTP (tamano esperado " + fmt_size(size) + "). Probe: "
+                           + "; ".join(tried[:4]) + " ... Pon la ruta equivalente en 'base' del [ftp] de " + DELUGE_CONF)
+
+    def download(self, remote, local_part, size, label=""):
+        """Descarga con reanudacion. Devuelve cuando el archivo local tiene exactamente `size` bytes."""
+        import ftplib
+        local_part = Path(local_part)
+        local_part.parent.mkdir(parents=True, exist_ok=True)
+        last_print = [0.0]
+        for attempt in range(1, 6):
+            have = local_part.stat().st_size if local_part.exists() else 0
+            if have > size:
+                local_part.unlink()
+                have = 0
+            if have == size:
+                return
+            try:
+                self.ensure()
+                with open(local_part, "ab" if have else "wb") as fh:
+                    done = [have]
+
+                    def cb(chunk):
+                        fh.write(chunk)
+                        done[0] += len(chunk)
+                        now = time.time()
+                        if now - last_print[0] > 30:
+                            last_print[0] = now
+                            log(f"    {label}: {fmt_size(done[0])} / {fmt_size(size)} ({done[0] * 100 // max(size, 1)}%)")
+                    self.ftp.retrbinary("RETR " + remote, cb, blocksize=1 << 20, rest=have or None)
+            except (OSError, ftplib.Error, EOFError) as e:
+                self.ftp = None
+                flog(f"    FTP interrumpido ({e}); reintento {attempt}/5 (se reanuda)")
+                time.sleep(min(5 * attempt, 30))
+        have = local_part.stat().st_size if local_part.exists() else 0
+        if have != size:
+            raise RuntimeError(f"descarga incompleta ({fmt_size(have)} de {fmt_size(size)})")
+
+    def delete(self, remote):
+        self.ensure()
+        self.ftp.delete(remote)
+
+    def close(self):
+        try:
+            if self.ftp:
+                self.ftp.quit()
+        except Exception:  # noqa
+            pass
+
+
+def load_ftp(args):
+    """[ftp] de jd_deluge.ini (se pide una vez y se guarda con permisos 600). -> dict o None."""
+    conf = STATE_DIR / DELUGE_CONF
+    cp = configparser.ConfigParser(interpolation=None)
+    if conf.is_file():
+        cp.read(conf, encoding="utf-8")
+    sec = dict(cp["ftp"]) if cp.has_section("ftp") else {}
+    if not sec.get("host") or not sec.get("user") or not sec.get("password") or "TU_" in sec.get("host", ""):
+        if not sys.stdin.isatty():
+            log(f"Falta el [ftp] en {conf} (host, user, password). Editalo y vuelve a correr.")
+            return None
+        import getpass
+        log(f"\nNo hay datos del FTP del Appbox. Se guardan en {conf} (permisos 600, solo en tu NAS).")
+        host = input("Servidor FTP (ej. tuusuario.appboxes.co): ").strip()
+        port = input("Puerto [21]: ").strip() or "21"
+        user = input("Usuario FTP: ").strip()
+        pw = getpass.getpass("Contrasena FTP (no se muestra): ")
+        if not host or not user or not pw:
+            log("Cancelado.")
+            return None
+        block = FTP_TEMPLATE.format(host=host, port=port, user=user, password=pw)
+        if not args.dry_run:
+            text = conf.read_text(encoding="utf-8") if conf.is_file() else ""
+            text = re.sub(r"(?ms)^\[ftp\].*?(?=^\[|\Z)", "", text)
+            conf.write_text(text.rstrip("\n") + "\n" + block, encoding="utf-8")
+            try:
+                os.chmod(conf, 0o600)
+            except OSError:
+                pass
+        cp3 = configparser.ConfigParser(interpolation=None)
+        cp3.read_string(block)
+        sec = dict(cp3["ftp"])
+    return sec
+
+
+def ftp_flag(sec, key):
+    return (sec.get(key, "no") or "no").strip().lower() in ("yes", "true", "1", "si")
+
+
+def deluge_add_or_update(cli, t, tdir, wanted_idx, magnets):
+    """Asegura que el torrent este en la sesion de Deluge con (al menos) esos archivos activos. Nunca baja la
+    prioridad de lo que ya estaba. -> torrent_id."""
+    tid = t["infohash"]
+    present = set(cli.call("core.get_session_state") or [])
+    n = t["count"]
+    if tid not in present:
+        tfile = tdir / t["file"]
+        if t["file"].lower().endswith(".json"):          # solo teniamos la lista: hay que pedir el torrent real
+            m = magnets.get(tid)
+            if not m:
+                raise RuntimeError(f"{t['file']} no esta en Deluge y no hay magnet en {MAGNETS_FILE} para recrearlo")
+            meta = cli.magnet_metadata(m["uri"], cli.timeout)
+            real = tdir / (t["file"][:-len(".json")])
+            real.write_bytes(b"d4:info" + meta + b"e")
+            tfile = real
+        prios = [0] * n
+        for i in wanted_idx:
+            prios[i] = 4
+        dump = torrent_with_trackers(tfile, (magnets.get(tid) or {}).get("trackers", []))
+        import base64 as b64
+        res = cli.call("core.add_torrent_file", [tfile.name, b64.b64encode(dump).decode(),
+                                                 {"add_paused": True, "auto_managed": False, "file_priorities": prios}])
+        if not res:
+            raise RuntimeError("Deluge no acepto el torrent")
+        flog(f"  Torrent agregado a Deluge solo con {len(wanted_idx)} archivo(s) activos de {n}")
+    else:
+        st = cli.call("core.get_torrent_status", [tid, ["file_priorities", "state"]]) or {}
+        cur = list(st.get("file_priorities") or [])
+        if len(cur) == n:
+            new = list(cur)
+            for i in wanted_idx:
+                if new[i] == 0:
+                    new[i] = 4
+            if new != cur:
+                cli.call("core.set_torrent_options", [[tid], {"file_priorities": new}])
+                flog(f"  Torrent ya estaba en Deluge: se activaron {sum(1 for a, b in zip(cur, new) if a != b)} archivo(s) mas")
+        flog("  (el torrent ya estaba en Deluge; no se quita nada)")
+    if cli.label:
+        try:
+            cli.label_torrents([tid], cli.label)
+        except RuntimeError as e:
+            flog(f"  [!] etiqueta: {e}")
+    st = cli.call("core.get_torrent_status", [tid, ["state"]]) or {}
+    if (st.get("state") or "").lower() in ("paused", "queued"):
+        cli.call("core.resume_torrent", [tid])
+    return tid
+
+
+def process_outputs(root, job, staged, tool, keep_chd, report):
+    """Coloca/convierte un archivo ya traido. job['outs']: [{type: zip|chd|conv, dest}]. -> (ok, fallos)."""
+    fails = 0
+    placed = False
+    outs = job["outs"]
+    for o in [x for x in outs if x["type"] == "conv"]:
+        dest = root / o["dest"]
+        if dest.exists() and dest.stat().st_size > 0:
+            continue
+        if tool is None:
+            fails += 1
+            flog(f"  [pendiente] {o['dest']}: sin chdman ({report['tool_why']}); el CHD queda para convertirlo despues")
+            o["pending"] = True
+            continue
+        try:
+            msg = convert_chd(tool, staged, dest)
+            flog(f"  CONVERTIDO {o['dest']}: {msg}")
+            report["converted"] += 1
+        except (RuntimeError, OSError) as e:
+            fails += 1
+            flog(f"  [X] conversion de {o['dest']}: {e}")
+            if "SHA1" in str(e):
+                flog("      el CHD llego danado: se descarta y se volvera a bajar en la siguiente corrida")
+                o["corrupt"] = True
+            else:
+                o["pending"] = True
+    keep = [x for x in outs if x["type"] in ("zip", "chd")]
+    pend = [x for x in outs if x.get("pending")]
+    if any(x.get("corrupt") for x in outs):
+        keep = []
+    for i, o in enumerate(keep):
+        dest = root / o["dest"]
+        if dest.exists():
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        last = (i == len(keep) - 1) and not pend and not (keep_chd and any(x["type"] == "conv" for x in outs))
+        try:
+            if last:
+                shutil.move(str(staged), str(dest))
+                placed = True
+            else:
+                shutil.copy2(staged, dest)
+            report["placed"] += 1
+            flog(f"  COLOCADO {o['dest']}")
+        except OSError as e:
+            fails += 1
+            flog(f"  [X] no se pudo colocar {o['dest']}: {e}")
+    leftovers = (pend or (keep_chd and any(x["type"] == "conv" for x in outs))) and not any(x.get("corrupt") for x in outs)
+    if leftovers and not placed and staged.exists():           # el CHD se queda junto al destino para convertirlo luego
+        conv = [x for x in outs if x["type"] == "conv"][0]
+        target = (root / conv["dest"]).parent / job["f"]["path"].rsplit("/", 1)[-1]
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(staged), str(target))
+            flog(f"  CHD guardado en {rel(root, target)}")
+            placed = True
+        except OSError as e:
+            fails += 1
+            flog(f"  [X] no se pudo guardar el CHD: {e}")
+    if not placed and staged.exists():
+        try:
+            staged.unlink()
+        except OSError:
+            pass
+    return fails
+
+
+def fetch_torrent(root, args, cli, ftp, t, jobs, tdir, magnets, tool, keep_chd, cleanup, report):
+    """Descarga (y procesa) todos los archivos de un torrent. -> fallos."""
+    fails = 0
+    wanted = sorted(j["f"]["index"] for j in jobs)
+    tid = deluge_add_or_update(cli, t, tdir, wanted, magnets)
+    by_idx = {j["f"]["index"]: j for j in jobs}
+    pending = set(wanted)
+    total = sum(j["f"]["size"] for j in jobs)
+    last_line, last_prog, last_move = 0.0, -1, time.time()
+    flog(f"  Esperando {len(jobs)} archivo(s), {fmt_size(total)} (Ctrl+C para pausar: Deluge sigue y al volver a correr se retoma)")
+    while pending:
+        st = cli.call("core.get_torrent_status", [tid, ["state", "file_progress", "save_path", "download_payload_rate",
+                                                         "num_peers", "num_seeds", "total_done", "message"]]) or {}
+        state = (st.get("state") or "").lower()
+        if state == "error":
+            raise RuntimeError("Deluge marco el torrent con error: " + str(st.get("message") or "?"))
+        fp = st.get("file_progress") or []
+        done_now = [i for i in sorted(pending) if i < len(fp) and fp[i] >= 0.99999]
+        for i in done_now:
+            j = by_idx[i]
+            f = j["f"]
+            staged = STATE_DIR / FETCH_TMP / tid[:8] / f"{i}_{f['path'].rsplit('/', 1)[-1]}"
+            try:
+                if not (staged.is_file() and staged.stat().st_size == f["size"]):
+                    time.sleep(3)                           # que Deluge termine de escribir a disco
+                    free = shutil.disk_usage(STATE_DIR).free
+                    if free < f["size"] + (1 << 30):
+                        raise RuntimeError(f"falta espacio en el NAS ({fmt_size(free)} libres para {fmt_size(f['size'])})")
+                    remote = ftp.locate(st.get("save_path") or "", f["path"], f["size"])
+                    flog(f"  Trayendo por FTP: {f['path'].rsplit('/', 1)[-1]} ({fmt_size(f['size'])})")
+                    ftp.download(remote, str(staged) + ".part", f["size"], f["path"].rsplit("/", 1)[-1])
+                    shutil.move(str(staged) + ".part", str(staged))
+                else:
+                    remote = None
+                if staged.name.lower().endswith(".zip") or any(o["type"] == "zip" for o in j["outs"]):
+                    with zipfile.ZipFile(staged) as zf:
+                        bad = zf.testzip()
+                    if bad:
+                        raise RuntimeError(f"zip danado (falla {bad})")
+                elif any(o["type"] in ("chd", "conv") for o in j["outs"]) and chd_header(staged) is None:
+                    raise RuntimeError("el archivo traido no es un CHD valido")
+                fails += process_outputs(root, j, staged, tool, keep_chd, report)
+                report["files"] += 1
+                report["bytes"] += f["size"]
+                if cleanup and remote:
+                    try:
+                        ftp.delete(remote)
+                        flog(f"  (borrado del Appbox: {remote})")
+                    except Exception as e:  # noqa
+                        flog(f"  [!] no se pudo borrar del Appbox: {e}")
+            except (RuntimeError, OSError, zipfile.BadZipFile) as e:
+                fails += 1
+                flog(f"  [X] {f['path'].rsplit('/', 1)[-1]}: {e}")
+                if staged.exists():
+                    try:
+                        staged.unlink()
+                    except OSError:
+                        pass
+            pending.discard(i)
+            last_move = time.time()
+        if not pending:
+            break
+        got = sum(by_idx[i]["f"]["size"] * min(fp[i], 1.0) for i in pending if i < len(fp))
+        now = time.time()
+        if now - last_line > 60:
+            last_line = now
+            flog(f"  [{state or '?'}] {len(wanted) - len(pending)}/{len(wanted)} archivos | pendiente ~{fmt_size(sum(by_idx[i]['f']['size'] for i in pending) - got)}"
+                 f" | {fmt_size(st.get('download_payload_rate') or 0)}/s | peers {st.get('num_peers', 0)} (seeds {st.get('num_seeds', 0)})")
+        if got != last_prog:
+            last_prog, last_move = got, now
+        if now - last_move > 1800 and not (st.get("download_payload_rate") or 0):
+            raise RuntimeError("30 minutos sin avance ni velocidad (sin seeds?). Revisa el torrent en Deluge y vuelve a correr")
+        time.sleep(POLL_SECS)
+    return fails
+
+
+def disk_jobs(root, args, tmap):
+    """Trabajos de discos a partir de JD_Discos.json (lo genera cmd_disks). -> (descargas, conversiones locales, avisos)."""
+    jf = STATE_DIR / DISKS_JSON
+    if not jf.is_file():
+        return {}, [], []
+    items = json.loads(jf.read_text(encoding="utf-8"))
+    dl, local, notes = {}, [], []
+    for it in items:
+        st = it.get("status")
+        if it["kind"] == "POSIBLE":
+            continue
+        want_rel = it.get("dest") or it.get("destino")
+        if st == "APROX":
+            notes.append(f"{it['name']}: nombre aproximado, no se descarga solo (revisa el log de discos)")
+            continue
+        if st == "CONVERTIR" and it.get("chd_local"):
+            out = (it["dest"] if it.get("dest") else str(Path(it["chd_local"]).parent / it["name"]).replace("\\", "/"))
+            local.append({"chd": it["chd_local"], "dest": out})
+            continue
+        if st == "COPIAR" and it.get("chd_local") and it.get("dest"):
+            local.append({"chd": it["chd_local"], "dest": it["dest"], "copy": True})
+            continue
+        if st != "BAJAR" or not it.get("torrent") or not want_rel:
+            continue
+        tr = it["torrent"]
+        t = tmap.get(tr["file"])
+        f = next((x for x in t["files"] if x["path"] == tr["path"]), None) if t else None
+        if not f:
+            continue
+        j = dl.setdefault((t["infohash"], f["index"]), {"t": t, "f": f, "outs": []})
+        typ = "conv" if it.get("convert") else "chd"
+        if not any(o["dest"] == want_rel for o in j["outs"]):
+            j["outs"].append({"type": typ, "dest": want_rel})
+    return dl, local, notes
+
+
+def cmd_fetch(root, args):
+    """TODO en uno: copia lo local, y lo que falte (zips de ROMs y CHD de las MRA) lo baja de los torrents usando
+    tu Deluge (solo esos archivos), lo trae por FTP, convierte los CHD a .hdd/.img y verifica."""
+    what = getattr(args, "fetch_only", None)
+    tdir = STATE_DIR / TORRENTS_DIR
+    torrents, tidx, terrors = index_torrents(tdir)
+    for n, why in terrors:
+        log(f"[!] {n}: {why}")
+    if not torrents:
+        log(f"No hay torrents en {tdir}. Primero: menu 5 -> 1 (Magnets).")
+        return 1
+    tmap = {t["file"]: t for t in torrents}
+    jobs = {}
+    failed = 0
+    if what != "disks":
+        log("\n=== Paso 1: copiar de tu fuente local lo que ya tienes ===")
+        if Path(args.source).expanduser().is_dir():
+            cmd_check(root, args, copy=True)
+        else:
+            log(f"(fuente local no disponible: {args.source}; se salta este paso)")
+        log("\n=== Paso 2: zips que faltan y estan en los torrents ===")
+        excl = prepare_excludes(root, args)
+        R = analyze(root, args, excl)
+        plan, dats, dat_errors, _parts = zip_plan(root, args, R, torrents, tidx)
+        for tg in plan["targets"].values():
+            j = jobs.setdefault((tg["torrent"]["infohash"], tg["file"]["index"]),
+                                {"t": tg["torrent"], "f": tg["file"], "outs": []})
+            j["outs"].append({"type": "zip", "dest": tg["dest"]})
+        log(f"Zips por bajar: {len(plan['targets'])} ({fmt_size(sum(v['file']['size'] for v in plan['targets'].values()))}); "
+            f"sin fuente: {len(plan['unresolved'])} partes")
+    local_conv, notes = [], []
+    if what != "zips":
+        log("\n=== Paso 3: discos (CHD / HDD / IMG) ===")
+        try:
+            (STATE_DIR / DISKS_JSON).unlink()
+        except OSError:
+            pass
+        cmd_disks(root, args)
+        dj, local_conv, notes = disk_jobs(root, args, tmap)
+        for k, v in dj.items():
+            if k in jobs:
+                jobs[k]["outs"] += v["outs"]
+            else:
+                jobs[k] = v
+    for n in notes:
+        log(f"  aviso: {n}")
+    total = sum(j["f"]["size"] for j in jobs.values())
+    n_conv = sum(1 for j in jobs.values() for o in j["outs"] if o["type"] == "conv") + len(local_conv)
+    log(f"\nRESUMEN: {len(jobs)} archivo(s) a bajar de torrents = {fmt_size(total)} | {n_conv} conversion(es) CHD->imagen | "
+        f"{len(local_conv)} ya con CHD local")
+    if not jobs and not local_conv:
+        log("Nada que descargar ni convertir.")
+        return 0
+    free = shutil.disk_usage(STATE_DIR).free
+    log(f"Espacio libre en el NAS: {fmt_size(free)}")
+    if free < total + (2 << 30):
+        log("[!] Espacio insuficiente para esta descarga (se necesita ademas margen para convertir). Libera espacio y vuelve a correr.")
+        return 1
+    if args.dry_run:
+        by_t = defaultdict(list)
+        for j in jobs.values():
+            by_t[j["t"]["file"]].append(j)
+        for tf, js in by_t.items():
+            log(f"  [{tf}] {len(js)} archivo(s), {fmt_size(sum(j['f']['size'] for j in js))}")
+        log("[DRY-RUN] no se contacta a Deluge ni se descarga nada.")
+        return 0
+    if not confirm(f"Descargar {fmt_size(total)} y convertir? ", args):
+        log("Cancelado.")
+        return 0
+
+    report = {"files": 0, "bytes": 0, "placed": 0, "converted": 0, "tool_why": ""}
+    cli = load_deluge(args) if jobs else None
+    sec = load_ftp(args) if (jobs and cli is not None) else {}
+    if jobs and (cli is None or not sec):
+        return 1
+    tool = None
+    need_tool = any(o["type"] == "conv" for j in jobs.values() for o in j["outs"]) or local_conv
+    if need_tool and not getattr(args, 'no_convert', False):
+        ch = Chdman()
+        if ch.detect():
+            tool = ch
+            flog(f"Conversion con {'chdman local' if ch.bin else 'Docker (' + DOCKER_IMAGE + ')'}")
+        else:
+            report["tool_why"] = ch.why
+            flog(f"[!] No se puede convertir ahora: {ch.why}")
+    elif getattr(args, 'no_convert', False):
+        report["tool_why"] = "--no-convert"
+    keep_chd = ftp_flag(sec, "keep_chd") if sec else False
+    cleanup = ftp_flag(sec, "remote_cleanup") if sec else False
+
+    # conversiones/copias de CHD que ya estaban en el NAS
+    for lc in local_conv:
+        src, dest = root / lc["chd"], root / lc["dest"]
+        if dest.exists() and dest.stat().st_size > 0:
+            continue
+        try:
+            if lc.get("copy"):
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dest)
+                flog(f"COPIADO {lc['dest']}")
+            elif tool is None:
+                raise RuntimeError("sin chdman: " + report["tool_why"])
+            else:
+                flog(f"Convirtiendo {lc['chd']} ...")
+                flog(f"  CONVERTIDO {lc['dest']}: {convert_chd(tool, src, dest)}")
+                report["converted"] += 1
+        except (RuntimeError, OSError) as e:
+            failed += 1
+            flog(f"  [X] {lc['dest']}: {e}")
+
+    if jobs:
+        magnets = {}
+        mf = STATE_DIR / MAGNETS_FILE
+        if mf.is_file():
+            magnets = {m["infohash"]: m for m in read_magnets(mf)[0]}
+        try:
+            cli.login()
+        except RuntimeError as e:
+            flog(f"[!] Deluge: {e}")
+            return 1
+        ftp = FtpFetch(sec)
+        by_t = defaultdict(list)
+        for j in jobs.values():
+            by_t[j["t"]["infohash"]].append(j)
+        try:
+            for ih, js in by_t.items():
+                t = js[0]["t"]
+                flog(f"\n### {t['name']}: {len(js)} archivo(s), {fmt_size(sum(j['f']['size'] for j in js))}")
+                try:
+                    failed += fetch_torrent(root, args, cli, ftp, t, js, tdir, magnets, tool, keep_chd, cleanup, report)
+                except RuntimeError as e:
+                    failed += len(js)
+                    flog(f"  [X] {t['name']}: {e}")
+        except KeyboardInterrupt:
+            flog("\nInterrumpido: Deluge sigue bajando; vuelve a correr 'fetch' y se retoma lo que falte.")
+            failed += 1
+        finally:
+            ftp.close()
+    flog(f"\nLISTO: {report['files']} archivo(s) traidos ({fmt_size(report['bytes'])}), {report['placed']} colocados, "
+         f"{report['converted']} convertidos, {failed} fallo(s). Log: {STATE_DIR / FETCH_LOG}")
+    if what != "disks" and report["files"]:
+        log("\nRevision final de las MRA con lo nuevo:")
+        if Path(args.source).expanduser().is_dir():
+            cmd_check(root, args)
+    return failed
+
+
 def cmd_organize(root, args):
     mode = args.mode
     scan_dirs = list(args.scan or DEFAULT_SCAN)
@@ -3411,6 +4110,8 @@ def run_action(act, root, args):
         cmd_disks(root, args)
     elif act == "magnets":
         cmd_magnets(root, args)
+    elif act == "fetch":
+        failed = cmd_fetch(root, args)
     elif act == "log":
         cmd_log(root, args)
     elif act == "github":
@@ -3424,7 +4125,7 @@ def run_action(act, root, args):
     return failed
 
 
-ACCIONES = ["update", "organize", "check", "copy", "rebuild", "rescan", "all", "torrents", "magnets", "disks", "log", "github", "github-lists",
+ACCIONES = ["update", "organize", "check", "copy", "rebuild", "rescan", "all", "torrents", "magnets", "disks", "fetch", "log", "github", "github-lists",
             "undo-organize", "undo-rebuild"]
 # Menu en arbol: (tecla, texto, accion) o (tecla, texto, [submenu]) o (tecla, texto, accion, {ajustes a args}).
 # Los comandos de linea (python3 jd_update.py update, check, ...) no cambian: esto es solo el menu.
@@ -3443,6 +4144,9 @@ MENU = [
         ("2", "Discos: que MRA piden HDD/IMG/CHD y cuales faltan (solo revisa)", "disks"),
         ("3", "Zips: planear que bajar de los torrents (solo planea)", "torrents"),
         ("4", "Buscar un archivo o juego dentro de los torrents", "torrents", {"_ask_find": True}),
+        ("5", "DESCARGAR Y CONVERTIR todo lo que falta (zips + CHD -> .hdd/.img) via tu Deluge", "fetch"),
+        ("6", "Descargar y convertir SOLO discos (CHD)", "fetch", {"fetch_only": "disks"}),
+        ("7", "Descargar SOLO zips de ROMs", "fetch", {"fetch_only": "zips"}),
     ]),
     ("6", "Ver logs", [
         ("1", "Revision de ROMs (JD_Check.log)", "log", {"log": CHECK_LOG}),
@@ -3567,6 +4271,8 @@ def main():
                     help=f"carpetas de zips de ROMs (la primera es la de nombres simples). Def.: {', '.join(DEFAULT_ROM_DIRS)}")
     ap.add_argument("--cores-dir", default=DEFAULT_CORES_DIR, help=f"carpeta de los .rbf (def. {DEFAULT_CORES_DIR})")
     ap.add_argument("--source", default=SOURCE_DIR, help="carpeta fuente de ROMs merged (def. la fija del script)")
+    ap.add_argument("--fetch-only", choices=["zips", "disks"], help="fetch: solo zips de ROMs o solo discos")
+    ap.add_argument("--no-convert", action="store_true", help="fetch: no convertir CHD (los deja para despues)")
     ap.add_argument("--rescan", action="store_true", help="regenerar jd_roms.db antes de copiar")
     ap.add_argument("--find", metavar="TEXTO", help="torrents: buscar un archivo/juego dentro de los .torrent")
     ap.add_argument("--section", metavar="N|TEXTO", help="log: mostrar una seccion (numero o parte del titulo)")
