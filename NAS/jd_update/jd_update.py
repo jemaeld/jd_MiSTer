@@ -2323,6 +2323,12 @@ def read_torrent(path):
     """-> dict(file, name, infohash, piece_length, files[{index, path, size}], count, total).
     'index' es la posicion real del archivo en el torrent (la que usan los clientes para
     marcar prioridades); 'count' es cuantos archivos tiene en total (incluye relleno)."""
+    if str(path).lower().endswith(".json"):          # lista de archivos tomada de un torrent ya presente en Deluge
+        j = json.loads(Path(path).read_text(encoding="utf-8"))
+        files = [{"index": int(f["index"]), "path": str(f["path"]), "size": int(f["size"])} for f in j["files"]]
+        return {"file": Path(path).name, "name": j["name"], "infohash": j["infohash"].lower(),
+                "piece_length": int(j.get("piece_length") or 0), "files": files,
+                "count": int(j.get("count") or len(files)), "total": sum(f["size"] for f in files)}
     data = Path(path).read_bytes()
     meta, span = bdecode(data)
     if not isinstance(meta, dict) or span is None or not isinstance(meta.get(b"info"), dict):
@@ -2356,7 +2362,7 @@ def index_torrents(tdir):
     torrents, idx, errors = [], defaultdict(list), []
     if not tdir.is_dir():
         return torrents, idx, errors
-    for p in sorted(tdir.glob("*.torrent"), key=lambda x: x.name.lower()):
+    for p in sorted(list(tdir.glob("*.torrent")) + list(tdir.glob("*.torrent.json")), key=lambda x: x.name.lower()):
         try:
             t = read_torrent(p)
         except (OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError) as e:
@@ -2909,6 +2915,23 @@ class DelugeWeb:
         return b64.b64decode(meta if isinstance(meta, (str, bytes)) else str(meta))
 
 
+def session_file_list(cli, m):
+    """Si el torrent YA esta en la sesion de Deluge, toma su lista de archivos de ahi (sin tocarlo).
+    -> dict listo para guardar como .torrent.json, o lanza RuntimeError."""
+    st = cli.call("core.get_torrent_status", [m["infohash"], ["name", "files", "piece_length", "total_size"]])
+    files = (st or {}).get("files") or []
+    if not files:
+        raise RuntimeError("esta en Deluge pero todavia sin metadatos (espera a que muestre su tamano y reintenta)")
+    out = []
+    for f in files:
+        path = str(f["path"])
+        if "/.pad/" in path or "_____padding_file" in path:
+            continue
+        out.append({"index": int(f["index"]), "path": path, "size": int(f["size"])})
+    return {"name": st.get("name") or m["name"] or m["infohash"], "infohash": m["infohash"],
+            "piece_length": int(st.get("piece_length") or 0), "count": len(files), "files": out}
+
+
 def load_deluge(args):
     """Lee jd_deluge.ini (o lo pide una vez y lo guarda con permisos 600). Devuelve DelugeWeb o None."""
     conf = STATE_DIR / DELUGE_CONF
@@ -2987,7 +3010,21 @@ def cmd_magnets(root, args):
         try:
             meta = cli.magnet_metadata(m["uri"], cli.timeout)
         except RuntimeError as e:
-            log(f"[!] {label}: {e}")
+            if "already exists" not in str(e):
+                log(f"[!] {label}: {e}")
+                continue
+            log("  Ya esta en tu Deluge: se toma la lista de archivos de ahi (no se modifica nada en Deluge).")
+            try:
+                j = session_file_list(cli, m)
+                fname = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", label).strip(" .") or m["infohash"]
+                dest = tdir / (fname + ".torrent.json")
+                dest.write_text(json.dumps(j, ensure_ascii=False), encoding="utf-8")
+                t = read_torrent(dest)
+            except (RuntimeError, OSError, ValueError, KeyError, TypeError) as e2:
+                log(f"[!] {label}: {e2}")
+                continue
+            ok += 1
+            log(f"  OK {dest.name}: {len(t['files'])} archivos, {fmt_size(t['total'])}")
             continue
         if hashlib.sha1(meta).hexdigest() != m["infohash"]:
             log(f"[!] {label}: los metadatos recibidos NO coinciden con el hash del magnet; se descartan.")
@@ -3061,7 +3098,7 @@ def cmd_check(root, args, copy=False, rebuild=False):
         idx = load_roms_db(source, db_path, False, create=False)
     tor_names = None
     _tdir = STATE_DIR / TORRENTS_DIR
-    if _tdir.is_dir() and any(_tdir.glob("*.torrent")):
+    if _tdir.is_dir() and (any(_tdir.glob("*.torrent")) or any(_tdir.glob("*.torrent.json"))):
         tor_names = set(index_torrents(_tdir)[1])
     write_report(root, R, args, idx, copy_rep, rb, tor_names)
     log("")
