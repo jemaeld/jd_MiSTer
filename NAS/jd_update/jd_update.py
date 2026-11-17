@@ -3883,7 +3883,9 @@ def cmd_fetch(root, args):
     failed = 0
     if what != "disks":
         log("\n=== Paso 1: copiar de tu fuente local lo que ya tienes ===")
-        if Path(args.source).expanduser().is_dir():
+        if getattr(args, "skip_copy", False):
+            log("(ya hecho en el paso anterior)")
+        elif Path(args.source).expanduser().is_dir():
             cmd_check(root, args, copy=True)
         else:
             log(f"(fuente local no disponible: {args.source}; se salta este paso)")
@@ -4098,12 +4100,18 @@ def run_action(act, root, args):
     elif act == "rescan":
         cmd_rescan(root, args)
     elif act == "all":
-        log("\n##### 1/3  ACTUALIZAR #####")
+        log("\n##### 1/4  ACTUALIZAR #####")
         failed = run_update(args, root)["failed"]
-        log("\n##### 2/3  ORGANIZAR MRA POR CORE #####")
+        log("\n##### 2/4  ORGANIZAR MRA POR CORE #####")
         cmd_organize(root, args)
-        log("\n##### 3/3  REVISAR Y COPIAR ROMS #####")
+        log("\n##### 3/4  REVISAR Y COPIAR ROMS #####")
         cmd_check(root, args, copy=True)
+        log("\n##### 4/4  DESCARGAR LO QUE FALTA (torrents via Deluge) Y CONVERTIR CHD #####")
+        args.skip_copy = True
+        try:
+            failed += cmd_fetch(root, args) or 0
+        finally:
+            args.skip_copy = False
     elif act == "torrents":
         cmd_torrents(root, args)
     elif act == "disks":
@@ -4130,7 +4138,7 @@ ACCIONES = ["update", "organize", "check", "copy", "rebuild", "rescan", "all", "
 # Menu en arbol: (tecla, texto, accion) o (tecla, texto, [submenu]) o (tecla, texto, accion, {ajustes a args}).
 # Los comandos de linea (python3 jd_update.py update, check, ...) no cambian: esto es solo el menu.
 MENU = [
-    ("1", "TODO: actualizar + organizar + copiar ROMs", "all"),
+    ("1", "TODO: actualizar + organizar + copiar ROMs + descargar lo que falte", "all"),
     ("2", "Actualizar DBs                (descarga lo de jd_update.list)", "update"),
     ("3", "Organizar MRA                 (_CORE, _A-Z, _DEBUT, _UPDATED...)", "organize"),
     ("4", "ROMs: revisar, copiar, reconstruir", [
