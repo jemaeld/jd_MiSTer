@@ -3611,6 +3611,30 @@ class FtpFetch:
         self.visited = visited
         return hits
 
+    def _find_mount(self, first, maxdepth=3, maxlist=80):
+        """Carpeta del FTP que contiene la carpeta `first` (ej. 'torrents'): el prefijo que separa la ruta de Deluge de la
+        del FTP (ej. /apps/deluge.tuusuario.appboxes.co). -> ruta ('' = raiz) o None."""
+        key = "mount:" + first
+        if key in self.found:
+            return self.found[key]
+        level, listed, hit = [""], 0, None
+        for _d in range(maxdepth):
+            nxt = []
+            for base in level:
+                if listed >= maxlist:
+                    break
+                listed += 1
+                items = self._ls(base or "/")
+                if any(isdir and n == first for n, isdir in items):
+                    hit = base
+                    break
+                nxt += [base + "/" + n for n, isdir in items if isdir][:60]
+            if hit is not None:
+                break
+            level = nxt
+        self.found[key] = hit
+        return hit
+
     def locate(self, save_path, rel, size):
         """Ruta REMOTA del archivo. Primero se prueba save_path de Deluge (quitando carpetas del principio, porque el
         FTP suele estar 'enjaulado'); si no, se busca por el nombre de la carpeta del torrent en todo el FTP."""
@@ -3629,6 +3653,15 @@ class FtpFetch:
                 tried.append(p)
                 if self._size(p) == size:
                     return p
+        if parts:
+            mount = self._find_mount(parts[0])
+            if mount is not None:
+                for sp in [save_path] + ["/" + "/".join(parts[:-1] + [x]) for x in ("completed", "downloading") if parts[-1] != x]:
+                    p = mount + "/" + sp.strip("/") + "/" + rel
+                    tried.append(p)
+                    if self._size(p) == size:
+                        self.prefix[save_path] = mount
+                        return p
         top = rel.split("/")[0]
         self.found.pop(top, None)               # el torrent puede haberse movido (downloading -> completed)
         for parent in self._discover(top):
@@ -3993,14 +4026,17 @@ def cmd_ftpscan(args):
     shown = [0]
 
     def walk(path, depth):
-        if depth > 3 or shown[0] > 250:
+        if depth > 3 or shown[0] > 60:
             return
         items = ft._ls(path or "/")
         dirs = [n for n, d in items if d]
         files = [n for n, d in items if not d]
-        for n in sorted(dirs)[:40]:
+        for n in sorted(dirs)[:15]:
             shown[0] += 1
             log("  " * depth + "/" + n + "/")
+            if n.lower() in ("storage", "movies", "series", "music", "tv"):
+                log("  " * (depth + 1) + "(no se lista)")
+                continue
             walk(path + "/" + n, depth + 1)
         if files and depth >= 1:
             log("  " * depth + f"({len(files)} archivo(s), ej.: {', '.join(sorted(files)[:3])})")
