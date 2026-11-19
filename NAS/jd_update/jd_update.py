@@ -3489,6 +3489,10 @@ def convert_chd(tool, chd, out_final, keep_chd_at=None):
     return f"{out_final.name} ({fmt_size(out_final.stat().st_size)}, {note})"
 
 
+class FtpLayoutError(RuntimeError):
+    pass
+
+
 class FtpFetch:
     def __init__(self, cfg):
         self.cfg, self.ftp, self.prefix, self.found = cfg, None, {}, {}
@@ -3574,25 +3578,37 @@ class FtpFetch:
             pass
         return out
 
-    def _discover(self, top, maxdepth=4):
-        """Carpetas del FTP llamadas `top` (el nombre del torrent), buscando desde la raiz. -> lista de rutas padre."""
+    FTP_HINTS = ("torrents", "completed", "downloading", "deluge", "downloads", "download", "data", "storage",
+                 "files", "complete", "mame", "mister")
+
+    def _discover(self, top, maxlist=600, tmax=150):
+        """Carpetas del FTP llamadas `top` (el nombre del torrent). Busqueda por prioridad desde la raiz (primero las
+        carpetas con nombres tipicos de Deluge). -> lista de rutas padre."""
+        import heapq
         if top in self.found:
             return self.found[top]
-        hits, level = [], [""]
-        for _depth in range(maxdepth):
-            nxt = []
-            for base in level:
-                for name, isdir in self._ls(base or "/"):
-                    if not isdir:
-                        continue
-                    if name == top:
-                        hits.append(base)
-                    elif _depth < maxdepth - 1:
-                        nxt.append(base + "/" + name)
+        t0, hits, cnt, listed = time.time(), [], 0, 0
+        heap = [(0, 0, "")]
+        visited = []
+        while heap and listed < maxlist and time.time() - t0 < tmax:
+            _pr, _n, base = heapq.heappop(heap)
+            listed += 1
+            visited.append(base or "/")
+            for name, isdir in self._ls(base or "/"):
+                if not isdir:
+                    continue
+                if name == top:
+                    hits.append(base)
+                    continue
+                depth = base.count("/") + 1
+                if depth >= 9:
+                    continue
+                cnt += 1
+                heapq.heappush(heap, (depth + (0 if name.lower() in self.FTP_HINTS else 3), cnt, base + "/" + name))
             if hits:
                 break
-            level = nxt[:400]
         self.found[top] = hits
+        self.visited = visited
         return hits
 
     def locate(self, save_path, rel, size):
@@ -3623,9 +3639,10 @@ class FtpFetch:
             root_names = ", ".join(n + ("/" if d else "") for n, d in self._ls("/")[:25])
         except Exception:  # noqa
             root_names = "?"
-        raise RuntimeError("no encuentro el archivo en el FTP (tamano esperado " + fmt_size(size) + "). Deluge dice "
+        raise FtpLayoutError("no encuentro el archivo en el FTP (tamano esperado " + fmt_size(size) + "). Deluge dice "
                            + (save_path or "?") + "; la raiz del FTP tiene: " + (root_names or "(vacia)")
-                           + ". Si el archivo esta en otra ruta, ponla en 'base' del [ftp] de " + DELUGE_CONF)
+                           + f". Busque en {len(getattr(self, 'visited', []))} carpetas del FTP sin hallar la carpeta '{top}'. "
+                           + "Ejecuta  python3 jd_update.py ftpscan  para ver el arbol, o pon la ruta en 'base' del [ftp] de " + DELUGE_CONF)
 
     def download(self, remote, local_part, size, label=""):
         """Descarga con reanudacion. Devuelve cuando el archivo local tiene exactamente `size` bytes."""
@@ -3870,12 +3887,12 @@ def fetch_torrent(root, args, cli, ftp, t, jobs, tdir, magnets, tool, keep_chd, 
                     if free < f["size"] + (1 << 30):
                         raise RuntimeError(f"falta espacio en el NAS ({fmt_size(free)} libres para {fmt_size(f['size'])})")
                     remote = None
-                    for attempt in range(8):
+                    for attempt in range(3):
                         try:
                             remote = ftp.locate(st.get("save_path") or "", f["path"], f["size"])
                             break
-                        except RuntimeError:
-                            if attempt == 7:
+                        except FtpLayoutError:
+                            if attempt == 2:
                                 raise
                             flog("  (aun no aparece en el FTP; Deluge puede estar moviendo el torrent a 'completed'; reintento)")
                             time.sleep(20)
@@ -3901,6 +3918,8 @@ def fetch_torrent(root, args, cli, ftp, t, jobs, tdir, magnets, tool, keep_chd, 
                         flog(f"  (borrado del Appbox: {remote})")
                     except Exception as e:  # noqa
                         flog(f"  [!] no se pudo borrar del Appbox: {e}")
+            except FtpLayoutError:
+                raise
             except (RuntimeError, OSError, zipfile.BadZipFile) as e:
                 fails += 1
                 flog(f"  [X] {f['path'].rsplit('/', 1)[-1]}: {e}")
@@ -3961,6 +3980,33 @@ def disk_jobs(root, args, tmap):
         if not any(o["dest"] == want_rel for o in j["outs"]):
             j["outs"].append({"type": typ, "dest": want_rel})
     return dl, local, notes
+
+
+def cmd_ftpscan(args):
+    """Muestra el arbol del FTP del Appbox (hasta 3 niveles) para saber donde esta lo que baja Deluge."""
+    sec = load_ftp(args)
+    if not sec:
+        return 1
+    ft = FtpFetch(sec)
+    ft.connect()
+    log(f"Arbol del FTP {sec.get('host')} (3 niveles; carpetas):")
+    shown = [0]
+
+    def walk(path, depth):
+        if depth > 3 or shown[0] > 250:
+            return
+        items = ft._ls(path or "/")
+        dirs = [n for n, d in items if d]
+        files = [n for n, d in items if not d]
+        for n in sorted(dirs)[:40]:
+            shown[0] += 1
+            log("  " * depth + "/" + n + "/")
+            walk(path + "/" + n, depth + 1)
+        if files and depth >= 1:
+            log("  " * depth + f"({len(files)} archivo(s), ej.: {', '.join(sorted(files)[:3])})")
+    walk("", 0)
+    ft.close()
+    return 0
 
 
 def cmd_fetch(root, args):
@@ -4226,6 +4272,8 @@ def run_action(act, root, args):
         cmd_magnets(root, args)
     elif act == "fetch":
         failed = cmd_fetch(root, args)
+    elif act == "ftpscan":
+        failed = cmd_ftpscan(args)
     elif act == "log":
         cmd_log(root, args)
     elif act == "github":
@@ -4239,7 +4287,7 @@ def run_action(act, root, args):
     return failed
 
 
-ACCIONES = ["update", "organize", "check", "copy", "rebuild", "rescan", "all", "torrents", "magnets", "disks", "fetch", "log", "github", "github-lists",
+ACCIONES = ["update", "organize", "check", "copy", "rebuild", "rescan", "all", "torrents", "magnets", "disks", "fetch", "ftpscan", "log", "github", "github-lists",
             "undo-organize", "undo-rebuild"]
 # Menu en arbol: (tecla, texto, accion) o (tecla, texto, [submenu]) o (tecla, texto, accion, {ajustes a args}).
 # Los comandos de linea (python3 jd_update.py update, check, ...) no cambian: esto es solo el menu.
