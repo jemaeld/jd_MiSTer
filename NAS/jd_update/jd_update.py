@@ -4309,6 +4309,7 @@ MENU = [
         ("5", "DESCARGAR Y CONVERTIR todo lo que falta (zips + CHD -> .hdd/.img) via tu Deluge", "fetch"),
         ("6", "Descargar y convertir SOLO discos (CHD)", "fetch", {"fetch_only": "disks"}),
         ("7", "Descargar SOLO zips de ROMs", "fetch", {"fetch_only": "zips"}),
+        ("8", "Ver el arbol del FTP del Appbox (para localizar donde baja Deluge)", "ftpscan"),
     ]),
     ("6", "Ver logs", [
         ("1", "Revision de ROMs (JD_Check.log)", "log", {"log": CHECK_LOG}),
