@@ -3668,12 +3668,22 @@ class FtpFetch:
             p = parent + "/" + rel
             if self._size(p) == size:
                 return p
+        root_names = "?"
         try:
-            root_names = ", ".join(n + ("/" if d else "") for n, d in self._ls("/")[:25])
+            mount = self.found.get("mount:" + parts[0]) if parts else None
+            sims = []
+            if mount is not None:
+                word = top.split()[0].lower()
+                for sub in ("completed", "downloading"):
+                    base_dir = mount + "/" + "/".join(parts[:-1] + [sub]) if parts[:-1] else mount + "/" + sub
+                    for n, d in self._ls(base_dir):
+                        if d and word in n.lower():
+                            sims.append(f"{base_dir}/{n}")
+            root_names = ("carpetas parecidas: " + "; ".join(sims[:6])) if sims else "no hay carpetas parecidas en completed/downloading (prefijo FTP: " + str(mount) + ")"
         except Exception:  # noqa
-            root_names = "?"
+            pass
         raise FtpLayoutError("no encuentro el archivo en el FTP (tamano esperado " + fmt_size(size) + "). Deluge dice "
-                           + (save_path or "?") + "; la raiz del FTP tiene: " + (root_names or "(vacia)")
+                           + (save_path or "?") + "; " + (root_names or "?")
                            + f". Busque en {len(getattr(self, 'visited', []))} carpetas del FTP sin hallar la carpeta '{top}'. "
                            + "Ejecuta  python3 jd_update.py ftpscan  para ver el arbol, o pon la ruta en 'base' del [ftp] de " + DELUGE_CONF)
 
@@ -3927,7 +3937,7 @@ def fetch_torrent(root, args, cli, ftp, t, jobs, tdir, magnets, tool, keep_chd, 
                         except FtpLayoutError:
                             if attempt == 2:
                                 raise
-                            flog("  (aun no aparece en el FTP; Deluge puede estar moviendo el torrent a 'completed'; reintento)")
+                            flog(f"  (aun no aparece en el FTP; Deluge dice {st.get('save_path')}; reintento)")
                             time.sleep(20)
                             st = cli.call("core.get_torrent_status", [tid, ["save_path"]]) or st
                     flog(f"  Trayendo por FTP: {f['path'].rsplit('/', 1)[-1]} ({fmt_size(f['size'])})")
