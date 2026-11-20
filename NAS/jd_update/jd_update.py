@@ -3611,13 +3611,14 @@ class FtpFetch:
         self.visited = visited
         return hits
 
-    def _find_mount(self, first, maxdepth=3, maxlist=80):
-        """Carpeta del FTP que contiene la carpeta `first` (ej. 'torrents'): el prefijo que separa la ruta de Deluge de la
-        del FTP (ej. /apps/deluge.tuusuario.appboxes.co). -> ruta ('' = raiz) o None."""
-        key = "mount:" + first
+    def _find_mounts(self, first, maxdepth=3, maxlist=120):
+        """Carpetas del FTP que contienen la carpeta `first` (ej. 'torrents'): posibles prefijos entre la ruta de Deluge y la
+        del FTP (ej. /apps/deluge.tuusuario.appboxes.co). Puede haber varias (qbittorrent, deluge...). -> lista, las que
+        mencionan 'deluge' primero."""
+        key = "mounts:" + first
         if key in self.found:
             return self.found[key]
-        level, listed, hit = [""], 0, None
+        level, listed, hits = [""], 0, []
         for _d in range(maxdepth):
             nxt = []
             for base in level:
@@ -3626,14 +3627,15 @@ class FtpFetch:
                 listed += 1
                 items = self._ls(base or "/")
                 if any(isdir and n == first for n, isdir in items):
-                    hit = base
-                    break
+                    hits.append(base)
+                    continue
                 nxt += [base + "/" + n for n, isdir in items if isdir][:60]
-            if hit is not None:
+            if hits:
                 break
             level = nxt
-        self.found[key] = hit
-        return hit
+        hits.sort(key=lambda h: 0 if "deluge" in h.lower() else 1)
+        self.found[key] = hits
+        return hits
 
     def locate(self, save_path, rel, size):
         """Ruta REMOTA del archivo. Primero se prueba save_path de Deluge (quitando carpetas del principio, porque el
@@ -3654,13 +3656,11 @@ class FtpFetch:
                 if self._size(p) == size:
                     return p
         if parts:
-            mount = self._find_mount(parts[0])
-            if mount is not None:
+            for mount in self._find_mounts(parts[0]):
                 for sp in [save_path] + ["/" + "/".join(parts[:-1] + [x]) for x in ("completed", "downloading") if parts[-1] != x]:
                     p = mount + "/" + sp.strip("/") + "/" + rel
                     tried.append(p)
                     if self._size(p) == size:
-                        self.prefix[save_path] = mount
                         return p
         top = rel.split("/")[0]
         self.found.pop(top, None)               # el torrent puede haberse movido (downloading -> completed)
@@ -3670,16 +3670,16 @@ class FtpFetch:
                 return p
         root_names = "?"
         try:
-            mount = self.found.get("mount:" + parts[0]) if parts else None
+            mounts = self.found.get("mounts:" + parts[0], []) if parts else []
             sims = []
-            if mount is not None:
-                word = top.split()[0].lower()
+            word = top.split()[0].lower()
+            for mount in mounts:
                 for sub in ("completed", "downloading"):
                     base_dir = mount + "/" + "/".join(parts[:-1] + [sub]) if parts[:-1] else mount + "/" + sub
                     for n, d in self._ls(base_dir):
                         if d and word in n.lower():
                             sims.append(f"{base_dir}/{n}")
-            root_names = ("carpetas parecidas: " + "; ".join(sims[:6])) if sims else "no hay carpetas parecidas en completed/downloading (prefijo FTP: " + str(mount) + ")"
+            root_names = ("carpetas parecidas: " + "; ".join(sims[:6])) if sims else "no hay carpetas parecidas en completed/downloading (prefijos FTP probados: " + ", ".join(mounts) + ")"
         except Exception:  # noqa
             pass
         raise FtpLayoutError("no encuentro el archivo en el FTP (tamano esperado " + fmt_size(size) + "). Deluge dice "
