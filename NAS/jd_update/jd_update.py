@@ -3662,11 +3662,17 @@ class FtpFetch:
         FTP suele estar 'enjaulado'); si no, se busca por el nombre de la carpeta del torrent en todo el FTP."""
         self.ensure()
         base = (self.cfg.get("base") or "").strip().rstrip("/")
-        if base:
-            p = base + "/" + rel
-            if self._size(p) == size:
-                return p
         parts = [x for x in (save_path or "").split("/") if x]
+        if base:
+            # 'base' puede ser el prefijo del FTP (ej. /apps/deluge.usuario.appboxes.co) o la carpeta de descargas completa
+            cands = [base + "/" + rel]
+            for sp in ["/".join(parts)] + ["/".join(parts[:-1] + [x]) for x in ("completed", "downloading")] + \
+                      ["torrents/completed", "torrents/downloading"]:
+                if sp:
+                    cands.append(base + "/" + sp + "/" + rel)
+            for p in cands:
+                if self._size(p) == size:
+                    return p
         tried = []
         for k in range(len(parts) + 1):
             pre = "/".join(parts[k:])
