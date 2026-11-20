@@ -82,6 +82,12 @@ DEFAULT_SCAN = ["_Arcade", "_Ongo"]                 # donde busca MRA el organiz
 CHECK_SCAN = ["_Arcade", "_Ongo", ORGANIZER]        # donde las busca la revision
 DEFAULT_ROM_DIRS = ["games/mame", "games/hbmame"]
 DEFAULT_CORES_DIR = "_Arcade/cores"
+# Version del script: se muestra en el menu, en los logs y con --version. Subela en cada cambio.
+#   1.0.0 (2026-11-20)  primera version numerada: descarga selectiva por Deluge+FTP, conversion CHD con chdman,
+#                       sin fuente local, comprobacion de discos dentro de revisar/todo, FTP 'base'/prefijos.
+VERSION = "1.0.0"
+VERSION_DATE = "2026-11-20"
+
 # Fuente local de ROMs (opcional). Vacia = sin fuente local: los zips y discos se obtienen SOLO de los torrents.
 # Para volver a usar una fuente local: ponla aqui o pasa --source RUTA.
 SOURCE_DIR = ""
@@ -1740,7 +1746,7 @@ def do_rebuild(root, R, args):
 
 def write_report(root, R, args, source_idx, copy_rep, rb, tor_names=None):
     L = [
-        "CHECK - JD Update (MRA / .rbf / ZIP)",
+        f"CHECK - JD Update v{VERSION} (MRA / .rbf / ZIP)",
         f"Fecha: {datetime.now():%Y-%m-%d %H:%M:%S}",
         f"Raiz: {root}",
         f"Cores (.rbf): {args.cores_dir}" + ("" if R.cores_ok else "  (NO EXISTE)"),
@@ -2127,9 +2133,11 @@ def cmd_github(root, args, only_lists=False):
             continue
         cur = local.read_bytes() if local.is_file() else None
         if cur is not None and cur.replace(b"\r\n", b"\n") == remote.replace(b"\r\n", b"\n"):
-            log(f"  {name}: ya esta al dia")
+            log(f"  {name}: ya esta al dia" + (f" (v{VERSION})" if name.endswith(".py") else ""))
             continue
         if name.endswith(".py"):
+            _rv = re.search(rb'^VERSION = "([^"]+)"', remote, re.M)
+            log(f"  {name}: version instalada v{VERSION} -> en GitHub v{_rv.group(1).decode() if _rv else '?'}")
             try:
                 compile(remote, name, "exec")
                 if b"def main(" not in remote:
@@ -4086,6 +4094,7 @@ def cmd_fetch(root, args):
     """TODO en uno: copia lo local, y lo que falte (zips de ROMs y CHD de las MRA) lo baja de los torrents usando
     tu Deluge (solo esos archivos), lo trae por FTP, convierte los CHD a .hdd/.img y verifica."""
     what = getattr(args, "fetch_only", None)
+    flog(f"--- fetch iniciado (JD Update v{VERSION}) ---")
     tdir = STATE_DIR / TORRENTS_DIR
     torrents, tidx, terrors = index_torrents(tdir)
     for n, why in terrors:
@@ -4307,7 +4316,7 @@ def cmd_rescan(root, args):
 def run_action(act, root, args):
     """Ejecuta una accion. Devuelve el numero de fallos (para el codigo de salida)."""
     failed = 0
-    log(f"Raiz: {root}" + ("   [DRY-RUN]" if args.dry_run else ""))
+    log(f"JD Update v{VERSION}   Raiz: {root}" + ("   [DRY-RUN]" if args.dry_run else ""))
     if act in ("update", "organize", "all") and not any((root / m).is_dir() for m in ("_Arcade", "games")):
         if not confirm(f"[!] {root} no tiene _Arcade ni games. Se crearia todo desde cero ahi. "
                        "Es la raiz correcta (instalacion nueva)?", args, strict=True):
@@ -4447,7 +4456,7 @@ def run_menu(title, items, root, args, top=False):
     """Un nivel del menu. Devuelve False si hay que salir de todo."""
     keys = {it[0]: it for it in items}
     while True:
-        print(f"\n===== {title} =====" + (f"   Raiz: {root}" if top else ""))
+        print(f"\n===== {title} =====" + (f"   v{VERSION}   Raiz: {root}" if top else ""))
         for it in items:
             print(f" {it[0]}) {it[1]}" + ("   >" if isinstance(it[2], list) else ""))
         print(f" d) Dry-run (simular, no cambia nada): {'SI' if args.dry_run else 'no'}")
@@ -4514,6 +4523,7 @@ def main():
                     help=f"carpetas de zips de ROMs (la primera es la de nombres simples). Def.: {', '.join(DEFAULT_ROM_DIRS)}")
     ap.add_argument("--cores-dir", default=DEFAULT_CORES_DIR, help=f"carpeta de los .rbf (def. {DEFAULT_CORES_DIR})")
     ap.add_argument("--source", default=SOURCE_DIR, help="carpeta fuente de ROMs merged (def. la fija del script)")
+    ap.add_argument("--version", action="version", version=f"JD Update v{VERSION} ({VERSION_DATE})")
     ap.add_argument("--fetch-only", choices=["zips", "disks"], help="fetch: solo zips de ROMs o solo discos")
     ap.add_argument("--no-convert", action="store_true", help="fetch: no convertir CHD (los deja para despues)")
     ap.add_argument("--rescan", action="store_true", help="regenerar jd_roms.db antes de copiar")
