@@ -96,3 +96,7 @@ baja de los torrents usando **tu Deluge** (agrega el torrent solo con esos archi
 del Appbox, verifica zips/CHD, convierte los CHD a `.hdd`/`.img` con `chdman` (local o Docker) comprobando el SHA1 del CHD,
 y coloca cada archivo en su destino. Opciones: `--fetch-only zips|disks`, `--no-convert`, `--dry-run`.
 Datos FTP en `jd_deluge.ini` (seccion `[ftp]`, solo en tu NAS). Log: `JD_Fetch.log`.
+
+## Sin fuente local
+
+`SOURCE_DIR` ahora va vacia: no se usa una copia local de las ROMs. Todo lo que falte (zips y CHD) se obtiene de los torrents con `fetch`. Para volver a usar una fuente local: `--source RUTA` o editar `SOURCE_DIR`.

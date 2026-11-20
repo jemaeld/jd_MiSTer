@@ -34,7 +34,7 @@ UN SOLO CRITERIO DE "FALTANTE"
   en orden, salta los que no existen, busca por CRC y luego por nombre.
 
 FUENTE DE ROMS (sin FTP)
-  Los zips que hagan falta se copian de SOURCE_DIR (MAME 0.289 merged, en el mismo NAS).
+  Los zips que hagan falta se obtienen de los torrents (via tu Deluge). Fuente local opcional: SOURCE_DIR o --source.
   Para no recorrer 10 000+ archivos cada vez se usa jd_roms.db (texto plano, una linea por zip:
   nombre<TAB>ruta relativa<TAB>tamano). Se crea sola la primera vez; usa --rescan o la opcion 6
   del menu cuando actualices la fuente. Nunca sobrescribe un zip existente.
@@ -82,7 +82,9 @@ DEFAULT_SCAN = ["_Arcade", "_Ongo"]                 # donde busca MRA el organiz
 CHECK_SCAN = ["_Arcade", "_Ongo", ORGANIZER]        # donde las busca la revision
 DEFAULT_ROM_DIRS = ["games/mame", "games/hbmame"]
 DEFAULT_CORES_DIR = "_Arcade/cores"
-SOURCE_DIR = "/volumeUSB1/usbshare/MAME 0.289 ROMs (merged)"
+# Fuente local de ROMs (opcional). Vacia = sin fuente local: los zips y discos se obtienen SOLO de los torrents.
+# Para volver a usar una fuente local: ponla aqui o pasa --source RUTA.
+SOURCE_DIR = ""
 ROMS_DB = "jd_roms.db"
 BIG_COPY = 2 * 1024 ** 3        # pregunta antes de copiar mas de 2 GB
 CHECK_LOG = "JD_Check.log"
@@ -1419,6 +1421,15 @@ def confirm(msg, args, strict=False):
         return False
 
 
+def src_path(args):
+    """Carpeta de la fuente local, o None si no hay fuente configurada o no existe (se usa solo el torrent)."""
+    src = (getattr(args, "source", "") or "").strip()
+    if not src:
+        return None
+    p = Path(src).expanduser()
+    return p if p.is_dir() else None
+
+
 def db_source(db_path):
     """Ruta de la fuente con la que se genero la DB (primeras lineas '# source=...')."""
     try:
@@ -1735,7 +1746,7 @@ def write_report(root, R, args, source_idx, copy_rep, rb, tor_names=None):
         f"Cores (.rbf): {args.cores_dir}" + ("" if R.cores_ok else "  (NO EXISTE)"),
         f"ROMs: {', '.join(R.rom_found) if R.rom_found else '(ninguna carpeta existe)'}  "
         f"(nombres simples se buscan en {R.rom_dirs[0]})",
-        f"Fuente de ROMs: {args.source}",
+        f"Fuente de ROMs: {args.source if src_path(args) else '(sin fuente local: se usan los torrents)'}",
         "Criterio: replica el cargador del MiSTer, parte por parte (un zip declarado que no existe solo "
         "cuenta si la MRA no carga)",
         f"MRAs: {len(R.entries)} | CARGAN: {R.n_load} | NO CARGAN: {R.n_solv + R.n_falta} "
@@ -2620,7 +2631,8 @@ def zip_plan(root, args, R, torrents, tidx):
                 log(f"[!] {p.name}: {e}")
                 continue
             dat_entries.setdefault(kind_of(p.name), []).append((hits, clone))
-    local_idx = load_roms_db(Path(args.source).expanduser(), STATE_DIR / ROMS_DB, False, create=False)
+    _src = src_path(args)
+    local_idx = load_roms_db(_src, STATE_DIR / ROMS_DB, False, create=False) if _src else None
     plan = plan_torrents(root, R, args, tidx, dat_entries, local_idx)
     return plan, dats, dat_errors, parts
 
@@ -4073,10 +4085,10 @@ def cmd_fetch(root, args):
         log("\n=== Paso 1: copiar de tu fuente local lo que ya tienes ===")
         if getattr(args, "skip_copy", False):
             log("(ya hecho en el paso anterior)")
-        elif Path(args.source).expanduser().is_dir():
+        elif src_path(args):
             cmd_check(root, args, copy=True)
         else:
-            log(f"(fuente local no disponible: {args.source}; se salta este paso)")
+            log("(sin fuente local: todo se obtiene de los torrents)")
         log("\n=== Paso 2: zips que faltan y estan en los torrents ===")
         excl = prepare_excludes(root, args)
         R = analyze(root, args, excl)
@@ -4202,8 +4214,7 @@ def cmd_fetch(root, args):
          f"{report['converted']} convertidos, {failed} fallo(s). Log: {STATE_DIR / FETCH_LOG}")
     if what != "disks" and report["files"]:
         log("\nRevision final de las MRA con lo nuevo:")
-        if Path(args.source).expanduser().is_dir():
-            cmd_check(root, args)
+        cmd_check(root, args)
     return failed
 
 
@@ -4231,12 +4242,17 @@ def cmd_organize(root, args):
 
 def cmd_check(root, args, copy=False, rebuild=False):
     excl = prepare_excludes(root, args)
-    source = Path(args.source).expanduser()
+    source = src_path(args)
     db_path = STATE_DIR / ROMS_DB
     R = analyze(root, args, excl)
     copy_rep, rb, idx = None, None, None
 
-    if copy:
+    if copy and source is None:
+        if R.need_zips:
+            log(f"\nFaltan {len(R.need_zips)} zip(s) y no hay fuente local: se obtienen de los torrents (descarga: menu 5 > 5, o la opcion 1).")
+        else:
+            log("\nNo falta ningun zip por copiar.")
+    elif copy:
         if R.need_zips or args.rescan:
             idx = load_roms_db(source, db_path, args.rescan, create=True)
         if R.need_zips:
@@ -4253,7 +4269,7 @@ def cmd_check(root, args, copy=False, rebuild=False):
         if rb[0]:
             log("\nSe vuelve a revisar con los zips creados:")
             R = analyze(root, args, excl)
-    if idx is None:
+    if idx is None and source is not None:
         idx = load_roms_db(source, db_path, False, create=False)
     tor_names = None
     _tdir = STATE_DIR / TORRENTS_DIR
@@ -4266,7 +4282,10 @@ def cmd_check(root, args, copy=False, rebuild=False):
 
 
 def cmd_rescan(root, args):
-    source = Path(args.source).expanduser()
+    source = src_path(args)
+    if source is None:
+        log("No hay fuente local configurada (los zips se obtienen de los torrents): no hay nada que reescanear.")
+        return
     load_roms_db(source, STATE_DIR / ROMS_DB, rescan=True, create=True)
 
 
@@ -4343,7 +4362,7 @@ MENU = [
     ("3", "Organizar MRA                 (_CORE, _A-Z, _DEBUT, _UPDATED...)", "organize"),
     ("4", "ROMs: revisar, copiar, reconstruir", [
         ("1", "Revisar                (ROMs + discos CHD/HDD/IMG; solo lee)", "check"),
-        ("2", "Revisar y COPIAR los zips que faltan (y comprobar discos)", "copy"),
+        ("2", "Revisar, copiar de la fuente local si la hay (y comprobar discos)", "copy"),
         ("3", "Reconstruir zips solucionables (con lo que ya tienes)", "rebuild"),
         ("4", "Reescanear la fuente de ROMs (regenera jd_roms.db)", "rescan"),
     ]),
