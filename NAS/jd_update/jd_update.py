@@ -3508,6 +3508,8 @@ class FtpLayoutError(RuntimeError):
 class FtpFetch:
     def __init__(self, cfg):
         self.cfg, self.ftp, self.prefix, self.found = cfg, None, {}, {}
+        self.last_err = ""
+        self.visited = []
 
     def connect(self):
         import ftplib
@@ -3549,46 +3551,52 @@ class FtpFetch:
             return None
 
     def _ls(self, path):
-        """[(nombre, es_carpeta)] de una carpeta remota (MLSD si se puede; si no, NLST)."""
+        """[(nombre, es_carpeta)] de una carpeta remota. Prueba MLSD, NLST y LIST; si todo falla reconecta una vez.
+        El ultimo error queda en self.last_err."""
+        for attempt in range(2):
+            try:
+                self.ensure()
+                res = self._ls_try(path)
+                if res is not None:
+                    return res
+            except Exception as e:  # noqa
+                self.last_err = f"{type(e).__name__}: {e}"
+            self.ftp = None                      # reconectar y reintentar
+        return []
+
+    def _ls_try(self, path):
+        import ftplib
+        errs = []
         try:
-            return self._ls_raw(path)
+            try:
+                out = []
+                for name, facts in self.ftp.mlsd(path or "/", facts=["type"]):
+                    t = (facts.get("type") or "").lower()
+                    if name in (".", "..") or t in ("cdir", "pdir"):
+                        continue
+                    out.append((name, t == "dir"))
+                return out
+            except (ftplib.Error, OSError, AttributeError) as e:
+                errs.append(f"MLSD {e}")
+            try:
+                lines = []
+                self.ftp.retrlines("LIST " + (path or "/"), lines.append)
+                out = []
+                for ln in lines:
+                    parts = ln.split(None, 8)
+                    if len(parts) < 9 or parts[8] in (".", ".."):
+                        continue
+                    out.append((parts[8], ln.startswith("d")))
+                return out
+            except (ftplib.Error, OSError) as e:
+                errs.append(f"LIST {e}")
         finally:
             try:
                 self.ftp.voidcmd("TYPE I")          # los listados dejan el FTP en modo ASCII, y SIZE ahi falla
             except Exception:  # noqa
                 pass
-
-    def _ls_raw(self, path):
-        import ftplib
-        out = []
-        try:
-            for name, facts in self.ftp.mlsd(path or "/", facts=["type"]):
-                t = (facts.get("type") or "").lower()
-                if name in (".", "..") or t in ("cdir", "pdir"):
-                    continue
-                out.append((name, t == "dir"))
-            return out
-        except (ftplib.Error, OSError, AttributeError):
-            pass
-        try:
-            names = self.ftp.nlst(path or "/")
-        except (ftplib.Error, OSError):
-            return []
-        cwd = self.ftp.pwd()
-        for n in names:
-            n = n.rsplit("/", 1)[-1]
-            if n in (".", "..", ""):
-                continue
-            try:
-                self.ftp.cwd((path.rstrip("/") + "/" + n) if path else n)
-                out.append((n, True))
-            except ftplib.Error:
-                out.append((n, False))
-        try:
-            self.ftp.cwd(cwd)
-        except ftplib.Error:
-            pass
-        return out
+        self.last_err = "; ".join(errs)
+        return None
 
     FTP_HINTS = ("torrents", "completed", "downloading", "deluge", "downloads", "download", "data", "storage",
                  "files", "complete", "mame", "mister")
@@ -3696,7 +3704,8 @@ class FtpFetch:
             pass
         raise FtpLayoutError("no encuentro el archivo en el FTP (tamano esperado " + fmt_size(size) + "). Deluge dice "
                            + (save_path or "?") + "; " + (root_names or "?")
-                           + f". Busque en {len(getattr(self, 'visited', []))} carpetas del FTP sin hallar la carpeta '{top}'. "
+                           + f". Busque en {len(getattr(self, 'visited', []))} carpetas del FTP sin hallar la carpeta '{top}'"
+                           + (f" (error del listado FTP: {self.last_err})" if self.last_err else "") + ". "
                            + "Ejecuta  python3 jd_update.py ftpscan  para ver el arbol, o pon la ruta en 'base' del [ftp] de " + DELUGE_CONF)
 
     def download(self, remote, local_part, size, label=""):
