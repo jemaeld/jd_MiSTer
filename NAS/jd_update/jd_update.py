@@ -83,10 +83,11 @@ CHECK_SCAN = ["_Arcade", "_Ongo", ORGANIZER]        # donde las busca la revisio
 DEFAULT_ROM_DIRS = ["games/mame", "games/hbmame"]
 DEFAULT_CORES_DIR = "_Arcade/cores"
 # Version del script: se muestra en el menu, en los logs y con --version. Subela en cada cambio.
+#   1.1.0 (2026-11-24)  fetch: cuenta regresiva de 60 s y descarga sola (sin terminal: sin preguntar); _PAST DEBUT y _PAST UPDATED guardan los ultimos 10 updates (antes 3).
 #   1.0.0 (2026-11-20)  primera version numerada: descarga selectiva por Deluge+FTP, conversion CHD con chdman,
 #                       sin fuente local, comprobacion de discos dentro de revisar/todo, FTP 'base'/prefijos.
-VERSION = "1.0.0"
-VERSION_DATE = "2026-11-20"
+VERSION = "1.1.0"
+VERSION_DATE = "2026-11-24"
 
 # Fuente local de ROMs (opcional). Vacia = sin fuente local: los zips y discos se obtienen SOLO de los torrents.
 # Para volver a usar una fuente local: ponla aqui o pasa --source RUTA.
@@ -105,7 +106,7 @@ HISTORY_FILE = "JD_Update_history.json"   # que MRA bajo cada update (nuevas / a
 CORE_DIR = "_CORE"                         # dentro de _@JD_Organizer: aqui van las carpetas por core
 SPECIAL_DIRS = ["_DEBUT", "_PAST DEBUT", "_UPDATED", "_PAST UPDATED", "_A-Z"]  # dentro de _@JD_Organizer
 OLD_SPECIAL = ["_PAST UPDATES"]            # nombre de una version anterior (se limpia sola)
-PAST_KEEP = 3                              # cuantos updates anteriores se conservan en _PAST ...
+PAST_KEEP = 10                             # cuantos updates anteriores se conservan en _PAST DEBUT y _PAST UPDATED
 HISTORY_MAX = 30                           # corridas guardadas en el historial
 BAD_CHARS = '<>:"/\\|?*'
 MODES = ["symlink", "hardlink", "copy", "move"]
@@ -1425,6 +1426,28 @@ def confirm(msg, args, strict=False):
         return input(msg + " [s/N] ").strip().lower() in ("s", "si", "sí", "y", "yes")
     except (EOFError, KeyboardInterrupt):
         return False
+
+
+def confirm_timeout(msg, args, secs=60):
+    """Pregunta con cuenta regresiva: si nadie responde en `secs` segundos, SIGUE (si). 'n' cancela, Enter/'s' sigue.
+    Sin terminal (cron, tarea programada) o con --yes: sigue sin preguntar. secs=0 -> sin espera (siempre sigue)."""
+    if args.yes or secs <= 0 or not (sys.stdin and sys.stdin.isatty()):
+        return True
+    import select
+    sys.stdout.write(f"{msg} [S/n]  (si no respondes, empieza sola en {secs} s; escribe n para cancelar): ")
+    sys.stdout.flush()
+    try:
+        r, _, _ = select.select([sys.stdin], [], [], secs)
+    except (OSError, ValueError):
+        return True
+    if not r:
+        print("\n(sin respuesta: se continua)")
+        return True
+    try:
+        ans = sys.stdin.readline().strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return ans not in ("n", "no", "c", "cancelar")
 
 
 def src_path(args):
@@ -3351,6 +3374,7 @@ def cmd_magnets(root, args):
 #  DESCARGA SELECTIVA (Deluge del Appbox -> FTP -> tu NAS) + CONVERSION DE CHD
 # ====================================================================
 FETCH_LOG = "JD_Fetch.log"
+FETCH_CONFIRM_SECS = 60      # espera antes de empezar a descargar sola (0 = sin preguntar)
 FETCH_TMP = ".fetch"
 POLL_SECS = 20
 DOCKER_IMAGE = "jd-chdman"
@@ -4162,7 +4186,7 @@ def cmd_fetch(root, args):
             log(f"  [{tf}] {len(js)} archivo(s), {fmt_size(sum(j['f']['size'] for j in js))}")
         log("[DRY-RUN] no se contacta a Deluge ni se descarga nada.")
         return 0
-    if not confirm(f"Descargar {fmt_size(total)} y convertir? ", args):
+    if not confirm_timeout(f"Descargar {fmt_size(total)} y convertir?", args, getattr(args, "confirm_secs", FETCH_CONFIRM_SECS)):
         log("Cancelado.")
         return 0
 
@@ -4523,6 +4547,7 @@ def main():
                     help=f"carpetas de zips de ROMs (la primera es la de nombres simples). Def.: {', '.join(DEFAULT_ROM_DIRS)}")
     ap.add_argument("--cores-dir", default=DEFAULT_CORES_DIR, help=f"carpeta de los .rbf (def. {DEFAULT_CORES_DIR})")
     ap.add_argument("--source", default=SOURCE_DIR, help="carpeta fuente de ROMs merged (def. la fija del script)")
+    ap.add_argument("--confirm-secs", type=int, default=FETCH_CONFIRM_SECS, help="fetch: segundos de espera antes de descargar sola (0 = sin preguntar)")
     ap.add_argument("--version", action="version", version=f"JD Update v{VERSION} ({VERSION_DATE})")
     ap.add_argument("--fetch-only", choices=["zips", "disks"], help="fetch: solo zips de ROMs o solo discos")
     ap.add_argument("--no-convert", action="store_true", help="fetch: no convertir CHD (los deja para despues)")
