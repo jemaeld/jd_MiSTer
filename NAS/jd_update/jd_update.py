@@ -83,11 +83,12 @@ CHECK_SCAN = ["_Arcade", "_Ongo", ORGANIZER]        # donde las busca la revisio
 DEFAULT_ROM_DIRS = ["games/mame", "games/hbmame"]
 DEFAULT_CORES_DIR = "_Arcade/cores"
 # Version del script: se muestra en el menu, en los logs y con --version. Subela en cada cambio.
+#   1.3.0 (2026-11-26)  log completo de CADA corrida en logs/JD_Run_<fecha>_<accion>.log (se conservan los ultimos 40).
 #   1.2.0 (2026-11-26)  opcion TODO: nuevo orden = actualizar, revisar, descargar/convertir y AL FINAL organizar.
 #   1.1.0 (2026-11-24)  fetch: cuenta regresiva de 60 s y descarga sola (sin terminal: sin preguntar); _PAST DEBUT y _PAST UPDATED guardan los ultimos 10 updates (antes 3).
 #   1.0.0 (2026-11-20)  primera version numerada: descarga selectiva por Deluge+FTP, conversion CHD con chdman,
 #                       sin fuente local, comprobacion de discos dentro de revisar/todo, FTP 'base'/prefijos.
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 VERSION_DATE = "2026-11-26"
 
 # Fuente local de ROMs (opcional). Vacia = sin fuente local: los zips y discos se obtienen SOLO de los torrents.
@@ -4390,6 +4391,8 @@ def run_action(act, root, args):
         failed = cmd_ftpscan(args)
     elif act == "log":
         cmd_log(root, args)
+    elif act == "runlog":
+        cmd_runlog(root, args)
     elif act == "github":
         cmd_github(root, args)
     elif act == "github-lists":
@@ -4401,7 +4404,7 @@ def run_action(act, root, args):
     return failed
 
 
-ACCIONES = ["update", "organize", "check", "copy", "rebuild", "rescan", "all", "torrents", "magnets", "disks", "fetch", "ftpscan", "log", "github", "github-lists",
+ACCIONES = ["update", "organize", "check", "copy", "rebuild", "rescan", "all", "torrents", "magnets", "disks", "fetch", "ftpscan", "log", "runlog", "github", "github-lists",
             "undo-organize", "undo-rebuild"]
 # Menu en arbol: (tecla, texto, accion) o (tecla, texto, [submenu]) o (tecla, texto, accion, {ajustes a args}).
 # Los comandos de linea (python3 jd_update.py update, check, ...) no cambian: esto es solo el menu.
@@ -4429,6 +4432,7 @@ MENU = [
         ("1", "Revision de ROMs (JD_Check.log)", "log", {"log": CHECK_LOG}),
         ("2", "Discos (JD_Discos.log)", "log", {"log": DISKS_LOG}),
         ("3", "Torrents (JD_Torrents.log)", "log", {"log": TORRENT_LOG}),
+        ("4", "Logs de cada corrida (carpeta logs/)", "runlog"),
     ]),
     ("7", "Mantenimiento", [
         ("1", "Actualizar el script y las listas desde GitHub", "github"),
@@ -4468,7 +4472,7 @@ def _run_leaf(act, extra, root, args):
     if _RESTART:
         print("\nEl script se actualizo: vuelve a ejecutarlo para usar la version nueva.")
         return False
-    if act != "log":
+    if act not in ("log", "runlog"):
         try:
             input("\nEnter para continuar...")
         except (EOFError, KeyboardInterrupt):
@@ -4525,6 +4529,115 @@ def detect_root():
     return BASE_DIR
 
 
+# ---------------------------------------------------------------------
+#  Log de cada corrida: todo lo que sale en pantalla queda en logs/
+# ---------------------------------------------------------------------
+RUN_LOG_DIR = "logs"
+RUN_LOG_KEEP = 40
+_SECRET_RE = re.compile(r"(?i)(pass(?:word)?|token|secret|cookie)(\s*[=:]\s*)\S+")
+_RUN_LOG = {"path": None}
+
+
+class _Tee:
+    def __init__(self, stream, fh):
+        self.stream, self.fh = stream, fh
+
+    def write(self, s):
+        try:
+            self.stream.write(s)
+        except Exception:
+            pass
+        try:
+            self.fh.write(_SECRET_RE.sub(r"\1\2********", s))
+            self.fh.flush()
+        except Exception:
+            pass
+        return len(s)
+
+    def flush(self):
+        try:
+            self.stream.flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        try:
+            return self.stream.isatty()
+        except Exception:
+            return False
+
+    def fileno(self):
+        return self.stream.fileno()
+
+    def __getattr__(self, n):
+        return getattr(self.stream, n)
+
+
+def run_logs_dir():
+    return STATE_DIR / RUN_LOG_DIR
+
+
+def start_run_log(name, argv):
+    """Abre logs/JD_Run_*.log y duplica stdout/stderr en el. Nunca debe romper la corrida."""
+    try:
+        d = run_logs_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        path = d / f"JD_Run_{stamp}_{name}.log"
+        fh = open(path, "w", encoding="utf-8", errors="replace")
+        sys.stdout = _Tee(sys.stdout, fh)
+        sys.stderr = _Tee(sys.stderr, fh)
+        _RUN_LOG["path"] = path
+        _RUN_LOG["t0"] = time.time()
+        fh.write(f"JD Update v{VERSION} ({VERSION_DATE})\n")
+        fh.write(f"Inicio : {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        fh.write(f"Comando: {' '.join(argv)}\n")
+        fh.write(f"Equipo : {platform.node()} | {platform.machine()} | Python {platform.python_version()}\n")
+        fh.write("=" * 70 + "\n")
+        fh.flush()
+        olds = sorted(d.glob("JD_Run_*.log"))
+        for o in olds[:-RUN_LOG_KEEP]:
+            try:
+                o.unlink()
+            except OSError:
+                pass
+    except Exception:
+        _RUN_LOG["path"] = None
+
+
+def end_run_log(code):
+    p = _RUN_LOG.get("path")
+    if not p:
+        return
+    try:
+        dt = int(time.time() - _RUN_LOG.get("t0", time.time()))
+        sys.stdout.flush()
+        with open(p, "a", encoding="utf-8", errors="replace") as fh:
+            fh.write("=" * 70 + f"\nFin    : {time.strftime('%Y-%m-%d %H:%M:%S')} | duracion {dt // 60}m{dt % 60:02d}s | codigo de salida {code}\n")
+    except Exception:
+        pass
+
+
+def cmd_runlog(root, args):
+    d = run_logs_dir()
+    files = sorted(d.glob("JD_Run_*.log")) if d.is_dir() else []
+    if not files:
+        log("Todavia no hay logs de corridas en " + str(d))
+        return
+    log(f"Logs de corridas en {d} ({len(files)}):")
+    for f in files[-10:]:
+        log(f"  {f.name}  ({f.stat().st_size // 1024} KB)")
+    cur = _RUN_LOG["path"]
+    prev = [f for f in files if f != cur]
+    last = prev[-1] if prev else files[-1]
+    log(f"\nFinal de {last.name}:\n" + "-" * 60)
+    try:
+        for ln in last.read_text(encoding="utf-8", errors="replace").splitlines()[-40:]:
+            log(ln)
+    except OSError as e:
+        log(f"No pude leerlo: {e}")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Actualizar, organizar MRA, revisar y copiar ROMs (sin accion: menu)",
@@ -4572,9 +4685,16 @@ def main():
         sys.exit(f"No existe la carpeta: {root}")
     if not args.accion:
         if sys.stdin and sys.stdin.isatty():
-            return menu(root, args)
+            start_run_log("menu", sys.argv)
+            try:
+                return menu(root, args)
+            finally:
+                end_run_log(0)
         sys.exit("Indica una accion (" + ", ".join(ACCIONES) + ") o ejecuta en una terminal para ver el menu.")
+    if args.accion not in ("log", "runlog"):
+        start_run_log(args.accion, sys.argv)
     failed = run_action(args.accion, root, args)
+    end_run_log(1 if failed else 0)
     sys.exit(1 if failed else 0)
 
 
