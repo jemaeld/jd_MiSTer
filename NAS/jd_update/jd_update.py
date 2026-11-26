@@ -14,7 +14,7 @@ Sin argumentos abre un MENU numerado. Tambien se puede usar directo (cron, scrip
     python3 jd_update.py copy            # check + copia los zips que falten desde la fuente de ROMs
     python3 jd_update.py rebuild         # check + crea zips "solucionables" a partir de tus zips
     python3 jd_update.py rescan          # regenera jd_roms.db (indice de la fuente)
-    python3 jd_update.py all             # update + organize + copy
+    python3 jd_update.py all             # update + check + fetch (torrents) + organize (al final)
     python3 jd_update.py torrents        # lee torrents/*.torrent y dats/ y planea que zips bajar (no descarga todavia)
     python3 jd_update.py torrents --find tekken   # busca un juego/archivo dentro de los .torrent (zips, CHD...)
     python3 jd_update.py log             # lee JD_Check.log en la terminal (por secciones, con busqueda)
@@ -83,11 +83,12 @@ CHECK_SCAN = ["_Arcade", "_Ongo", ORGANIZER]        # donde las busca la revisio
 DEFAULT_ROM_DIRS = ["games/mame", "games/hbmame"]
 DEFAULT_CORES_DIR = "_Arcade/cores"
 # Version del script: se muestra en el menu, en los logs y con --version. Subela en cada cambio.
+#   1.2.0 (2026-11-26)  opcion TODO: nuevo orden = actualizar, revisar, descargar/convertir y AL FINAL organizar.
 #   1.1.0 (2026-11-24)  fetch: cuenta regresiva de 60 s y descarga sola (sin terminal: sin preguntar); _PAST DEBUT y _PAST UPDATED guardan los ultimos 10 updates (antes 3).
 #   1.0.0 (2026-11-20)  primera version numerada: descarga selectiva por Deluge+FTP, conversion CHD con chdman,
 #                       sin fuente local, comprobacion de discos dentro de revisar/todo, FTP 'base'/prefijos.
-VERSION = "1.1.0"
-VERSION_DATE = "2026-11-24"
+VERSION = "1.2.0"
+VERSION_DATE = "2026-11-26"
 
 # Fuente local de ROMs (opcional). Vacia = sin fuente local: los zips y discos se obtienen SOLO de los torrents.
 # Para volver a usar una fuente local: ponla aqui o pasa --source RUTA.
@@ -4362,14 +4363,12 @@ def run_action(act, root, args):
     elif act == "rescan":
         cmd_rescan(root, args)
     elif act == "all":
-        log("\n##### 1/4  ACTUALIZAR #####")
+        log("\n##### 1/4  ACTUALIZAR DBs #####")
         failed = run_update(args, root)["failed"]
-        log("\n##### 2/4  ORGANIZAR MRA POR CORE #####")
-        cmd_organize(root, args)
-        log("\n##### 3/4  REVISAR Y COPIAR ROMS + COMPROBAR DISCOS (CHD/HDD/IMG) #####")
+        log("\n##### 2/4  REVISAR ROMS + COMPROBAR DISCOS (CHD/HDD/IMG) #####")
         cmd_check(root, args, copy=True)
         cmd_disks(root, args)
-        log("\n##### 4/4  DESCARGAR LO QUE FALTA (torrents via Deluge) Y CONVERTIR CHD #####")
+        log("\n##### 3/4  DESCARGAR LO QUE FALTA (torrents via Deluge) Y CONVERTIR CHD #####")
         args.skip_copy = True
         args.skip_disks_scan = True
         try:
@@ -4377,6 +4376,8 @@ def run_action(act, root, args):
         finally:
             args.skip_copy = False
             args.skip_disks_scan = False
+        log("\n##### 4/4  ORGANIZAR MRA POR CORE (al final, con todo ya descargado) #####")
+        cmd_organize(root, args)
     elif act == "torrents":
         cmd_torrents(root, args)
     elif act == "disks":
@@ -4405,7 +4406,7 @@ ACCIONES = ["update", "organize", "check", "copy", "rebuild", "rescan", "all", "
 # Menu en arbol: (tecla, texto, accion) o (tecla, texto, [submenu]) o (tecla, texto, accion, {ajustes a args}).
 # Los comandos de linea (python3 jd_update.py update, check, ...) no cambian: esto es solo el menu.
 MENU = [
-    ("1", "TODO: actualizar + organizar + copiar ROMs + descargar lo que falte", "all"),
+    ("1", "TODO: actualizar + revisar + descargar lo que falte + organizar (al final)", "all"),
     ("2", "Actualizar DBs                (descarga lo de jd_update.list)", "update"),
     ("3", "Organizar MRA                 (_CORE, _A-Z, _DEBUT, _UPDATED...)", "organize"),
     ("4", "ROMs: revisar, copiar, reconstruir", [
