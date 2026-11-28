@@ -83,14 +83,16 @@ CHECK_SCAN = ["_Arcade", "_Ongo", ORGANIZER]        # donde las busca la revisio
 DEFAULT_ROM_DIRS = ["games/mame", "games/hbmame"]
 DEFAULT_CORES_DIR = "_Arcade/cores"
 # Version del script: se muestra en el menu, en los logs y con --version. Subela en cada cambio.
+#   1.4.0 (2026-11-28)  nunca se borran cores viejos: van a backup/cores/; lo reemplazado (MiSTer, .rbf) a backup/replaced/;
+#                       DB oficial Distribution_MiSTer + kit minimo para la SD (sd/: MiSTer, menu.rbf, linux).
 #   1.3.1 (2026-11-28)  update: si varias DBs traen la misma ruta, gana la primera de la lista (antes se pisaban y se re-descargaban en cada corrida).
 #   1.3.0 (2026-11-26)  log completo de CADA corrida en logs/JD_Run_<fecha>_<accion>.log (se conservan los ultimos 40).
 #   1.2.0 (2026-11-26)  opcion TODO: nuevo orden = actualizar, revisar, descargar/convertir y AL FINAL organizar.
 #   1.1.0 (2026-11-24)  fetch: cuenta regresiva de 60 s y descarga sola (sin terminal: sin preguntar); _PAST DEBUT y _PAST UPDATED guardan los ultimos 10 updates (antes 3).
 #   1.0.0 (2026-11-20)  primera version numerada: descarga selectiva por Deluge+FTP, conversion CHD con chdman,
 #                       sin fuente local, comprobacion de discos dentro de revisar/todo, FTP 'base'/prefijos.
-VERSION = "1.3.1"
-VERSION_DATE = "2026-11-26"
+VERSION = "1.4.0"
+VERSION_DATE = "2026-11-28"
 
 # Fuente local de ROMs (opcional). Vacia = sin fuente local: los zips y discos se obtienen SOLO de los torrents.
 # Para volver a usar una fuente local: ponla aqui o pasa --source RUTA.
@@ -416,6 +418,7 @@ def download_one(url, path, entry):
                 shutil.copyfileobj(r, f, 1 << 20)
             verify(tmp, entry)
             existed = path.exists()
+            backup_replaced(path)
             os.replace(tmp, path)
             note_change(path, existed)
             if entry.get("hash"):
@@ -431,6 +434,189 @@ def download_one(url, path, entry):
     raise last
 
 
+# ---------------------------------------------------------------------
+#  Versiones viejas de cores: NUNCA se borran, se mueven a backup/
+#  Kit minimo para la SD (MiSTer, menu.rbf, linux) en sd/
+# ---------------------------------------------------------------------
+BACKUP_DIR = "backup"
+SD_DIR = "sd"
+SD_STATE = "JD_SD_state.json"
+KEEP_CORE_VERSIONS = 1
+RE_CORE_DATED = re.compile(r"^(.+)_(\d{8})\.rbf$", re.I)
+BACKUP_CTX = {"root": None, "stamp": time.strftime("%Y%m%d_%H%M%S")}
+LINUX_INFO = {}
+_dir_newest = {}
+
+
+def newest_core_dates(d):
+    """{nombre_base_minusculas: fecha mas nueva} de los .rbf con fecha dentro de la carpeta d."""
+    r = _dir_newest.get(d)
+    if r is None:
+        r = {}
+        try:
+            for f in os.listdir(d):
+                m = RE_CORE_DATED.match(f)
+                if m:
+                    k = m.group(1).lower()
+                    r[k] = max(r.get(k, ""), m.group(2))
+        except OSError:
+            pass
+        _dir_newest[d] = r
+    return r
+
+
+def superseded_core(path):
+    """True si en la carpeta ya hay una version MAS NUEVA de este core (no se baja una vieja)."""
+    m = RE_CORE_DATED.match(path.name)
+    if not m:
+        return False
+    return newest_core_dates(str(path.parent)).get(m.group(1).lower(), "") > m.group(2)
+
+
+def backup_replaced(path):
+    """Antes de pisar un archivo importante (MiSTer, .rbf) guarda copia en backup/replaced/<fecha>/."""
+    root = BACKUP_CTX["root"]
+    if root is None or not path.exists():
+        return
+    if not (path.name == "MiSTer" or path.name.lower().endswith(".rbf")):
+        return
+    try:
+        rel = path.resolve().relative_to(Path(root).resolve())
+        dst = STATE_DIR / BACKUP_DIR / "replaced" / BACKUP_CTX["stamp"] / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(path), str(dst))
+    except (OSError, ValueError):
+        pass
+
+
+def backup_old_cores(root, dry_run, keep=None):
+    """Deja solo las `keep` versiones mas nuevas de cada core con fecha (Nombre_YYYYMMDD.rbf) por carpeta;
+    las demas se MUEVEN a backup/cores/<misma ruta>. Nunca borra."""
+    keep = KEEP_CORE_VERSIONS if keep is None else max(1, keep)
+    root = Path(root)
+    groups = {}
+    for top in sorted(os.listdir(root)):
+        tp = root / top
+        if not top.startswith("_") or top.startswith("_@") or not tp.is_dir() or tp.is_symlink():
+            continue
+        for dp, dns, fns in os.walk(tp):
+            dns[:] = [d for d in dns if not (Path(dp) / d).is_symlink()]
+            for f in fns:
+                m = RE_CORE_DATED.match(f)
+                if m and not (Path(dp) / f).is_symlink():
+                    groups.setdefault((dp, m.group(1).lower()), []).append((m.group(2), f))
+    moves = []
+    for (dp, _b), items in groups.items():
+        if len(items) <= keep:
+            continue
+        items.sort()
+        for _date, f in items[:-keep]:
+            moves.append((Path(dp) / f))
+    if not moves:
+        log("Cores viejos: ninguno que mover a backup.")
+        return 0
+    log(f"Cores con versiones viejas: {len(moves)} archivo(s) -> {STATE_DIR / BACKUP_DIR / 'cores'}"
+        + ("   [DRY-RUN]" if dry_run else ""))
+    done = 0
+    mlog = STATE_DIR / BACKUP_DIR / "JD_Backup_moves.log"
+    for src in moves:
+        rel = src.relative_to(root)
+        dst = STATE_DIR / BACKUP_DIR / "cores" / rel
+        if dry_run:
+            log(f"  (dry-run) {rel}")
+            continue
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if dst.exists():
+                dst = dst.with_name(dst.name + "." + BACKUP_CTX["stamp"])
+            shutil.move(str(src), str(dst))
+            done += 1
+            with open(mlog, "a", encoding="utf-8") as fh:
+                fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{rel}\t->\t{dst}\n")
+            if done <= 15:
+                log(f"  movido a backup: {rel}")
+        except OSError as e:
+            log(f"  [!] no pude mover {rel}: {e}")
+    if done > 15:
+        log(f"  ... y {done - 15} mas (lista completa: {mlog})")
+    return done
+
+
+def _find_7z():
+    for n in ("7z", "7za", "7zr", "7zz"):
+        p = shutil.which(n)
+        if p:
+            return p
+    return None
+
+
+def sd_kit(root, dry_run):
+    """Prepara sd/ con lo minimo que vive en la SD: MiSTer, menu.rbf y la ultima imagen de Linux."""
+    root = Path(root)
+    sd = STATE_DIR / SD_DIR
+    st_path = STATE_DIR / SD_STATE
+    try:
+        st = json.loads(st_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        st = {}
+    log("\n--- Kit minimo para la SD (sd/) ---")
+    if dry_run:
+        log("(dry-run) no se toca sd/")
+        return
+    sd.mkdir(parents=True, exist_ok=True)
+    changed = []
+    for name in ("MiSTer", "menu.rbf"):
+        src = root / name
+        if not src.is_file():
+            continue
+        dst = sd / name
+        if dst.is_file() and dst.stat().st_size == src.stat().st_size and md5_of(dst) == md5_of(src):
+            continue
+        if dst.exists():
+            old = STATE_DIR / BACKUP_DIR / "replaced" / BACKUP_CTX["stamp"] / ("sd_" + name)
+            old.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(dst), str(old))
+        shutil.copy2(str(src), str(dst))
+        changed.append(name)
+    info = LINUX_INFO.get("linux") or {}
+    ver = str(info.get("version") or "")
+    if info.get("url") and ver and st.get("linux_version") != ver:
+        fname = info["url"].rsplit("/", 1)[-1]
+        target = sd / fname
+        log(f"Linux nuevo: {ver} (antes: {st.get('linux_version', 'ninguno')}). Descargando {fname} ({int(info.get('size', 0)) // 1048576} MB)...")
+        try:
+            download_one(info["url"], target, {"hash": info.get("hash"), "size": info.get("size")})
+            for old in sd.glob("linux_release_*.7z"):
+                if old != target:
+                    dst = STATE_DIR / BACKUP_DIR / "replaced" / BACKUP_CTX["stamp"] / old.name
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(old), str(dst))
+            st["linux_version"] = ver
+            st["linux_file"] = fname
+            changed.append("linux " + ver)
+            z = _find_7z()
+            if z:
+                out = sd / "linux"
+                out.mkdir(exist_ok=True)
+                r = subprocess.run([z, "x", "-y", f"-o{out}", str(target)], capture_output=True, text=True)
+                log("  Linux extraido en sd/linux/" if r.returncode == 0 else f"  [!] no pude extraer con {z}: {r.stderr[-200:]}")
+            else:
+                log("  (no hay 7z en este equipo: extrae el .7z en tu PC y copia su contenido a la carpeta linux/ de la SD)")
+        except Exception as e:  # noqa
+            log(f"  [!] no pude bajar el Linux: {e}")
+    try:
+        st_path.write_text(json.dumps(st, indent=1), encoding="utf-8")
+    except OSError:
+        pass
+    (sd / "LEEME.txt").write_text(
+        "Kit minimo para la SD del MiSTer (lo genera jd_update.py).\n"
+        "Solo hace falta copiarlo a la SD cuando cambie: MiSTer y menu.rbf a la raiz de la SD;\n"
+        "el contenido de linux_release_*.7z (carpeta linux/) a la carpeta linux/ de la SD.\n"
+        f"Linux actual: {st.get('linux_version', '?')}\n", encoding="utf-8")
+    log("Cambios en el kit: " + (", ".join(changed) if changed else "ninguno (sd/ ya esta al dia)"))
+    log(f"Carpeta: {sd}")
+
+
 def plan_file(rel_path, entry, dest, tag_dict, pos, neg, fast):
     """('filtered'|'skip'|'todo'|'bad', path_o_mensaje)."""
     if not passes_filter(entry, tag_dict, pos, neg):
@@ -440,6 +626,8 @@ def plan_file(rel_path, entry, dest, tag_dict, pos, neg, fast):
     except ValueError as e:
         return "bad", str(e)
     if path.exists() and entry.get("overwrite") is False:
+        return "skip", None
+    if superseded_core(path):
         return "skip", None
     if is_up_to_date(path, entry, fast):
         return "skip", None
@@ -503,12 +691,15 @@ CLAIMED = {}   # ruta -> id de la primera DB que la declaro en esta corrida
 
 def process_db(db_cfg, glob_cfg, dest, workers, dry_run, fast):
     log(f"\n=== {db_cfg['id']} ===")
+    _dir_newest.clear()
     try:
         db = load_db(db_cfg["url"])
     except Exception as e:  # noqa
         log(f"[ERROR] No se pudo leer la DB: {e}")
         return {"ok": 0, "skipped": 0, "failed": 1}
 
+    if isinstance(db.get("linux"), dict) and db["linux"].get("url") and "linux" not in LINUX_INFO:
+        LINUX_INFO["linux"] = db["linux"]
     pos, neg = effective_filter(db_cfg, glob_cfg, db)
     if pos or neg:
         log(f"filtro: {' '.join(sorted(pos) + ['!' + n for n in sorted(neg)])}")
@@ -666,6 +857,8 @@ def run_update(args, root):
 
     total = {"ok": 0, "skipped": 0, "failed": 0}
     CLAIMED.clear()
+    LINUX_INFO.clear()
+    BACKUP_CTX["root"] = root
     HASHES.load(root, not args.no_hash_cache)
     try:
         for d in dbs:
@@ -675,6 +868,11 @@ def run_update(args, root):
     finally:
         HASHES.save()
     record_history(root, args.dry_run, args.mode)
+    try:
+        backup_old_cores(root, args.dry_run, getattr(args, "keep_versions", None))
+        sd_kit(root, args.dry_run)
+    except Exception as e:  # noqa
+        log(f"[!] backup/kit SD: {e}")
     if not args.fast and (HASHES.hits or HASHES.reads):
         log(f"MD5: {HASHES.hits} archivos sin releer (cache) | {HASHES.reads} leidos del disco")
     log(f"\nDescarga lista. Descargados: {total['ok']} | Al dia: {total['skipped']} | Fallidos: {total['failed']}")
@@ -4679,6 +4877,7 @@ def main():
     ap.add_argument("--cores-dir", default=DEFAULT_CORES_DIR, help=f"carpeta de los .rbf (def. {DEFAULT_CORES_DIR})")
     ap.add_argument("--source", default=SOURCE_DIR, help="carpeta fuente de ROMs merged (def. la fija del script)")
     ap.add_argument("--confirm-secs", type=int, default=FETCH_CONFIRM_SECS, help="fetch: segundos de espera antes de descargar sola (0 = sin preguntar)")
+    ap.add_argument("--keep-versions", type=int, default=KEEP_CORE_VERSIONS, help="update: versiones de cada core que se dejan en su carpeta (las demas van a backup/cores)")
     ap.add_argument("--version", action="version", version=f"JD Update v{VERSION} ({VERSION_DATE})")
     ap.add_argument("--fetch-only", choices=["zips", "disks"], help="fetch: solo zips de ROMs o solo discos")
     ap.add_argument("--no-convert", action="store_true", help="fetch: no convertir CHD (los deja para despues)")
