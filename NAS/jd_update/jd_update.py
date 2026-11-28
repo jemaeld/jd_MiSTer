@@ -83,12 +83,13 @@ CHECK_SCAN = ["_Arcade", "_Ongo", ORGANIZER]        # donde las busca la revisio
 DEFAULT_ROM_DIRS = ["games/mame", "games/hbmame"]
 DEFAULT_CORES_DIR = "_Arcade/cores"
 # Version del script: se muestra en el menu, en los logs y con --version. Subela en cada cambio.
+#   1.3.1 (2026-11-28)  update: si varias DBs traen la misma ruta, gana la primera de la lista (antes se pisaban y se re-descargaban en cada corrida).
 #   1.3.0 (2026-11-26)  log completo de CADA corrida en logs/JD_Run_<fecha>_<accion>.log (se conservan los ultimos 40).
 #   1.2.0 (2026-11-26)  opcion TODO: nuevo orden = actualizar, revisar, descargar/convertir y AL FINAL organizar.
 #   1.1.0 (2026-11-24)  fetch: cuenta regresiva de 60 s y descarga sola (sin terminal: sin preguntar); _PAST DEBUT y _PAST UPDATED guardan los ultimos 10 updates (antes 3).
 #   1.0.0 (2026-11-20)  primera version numerada: descarga selectiva por Deluge+FTP, conversion CHD con chdman,
 #                       sin fuente local, comprobacion de discos dentro de revisar/todo, FTP 'base'/prefijos.
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 VERSION_DATE = "2026-11-26"
 
 # Fuente local de ROMs (opcional). Vacia = sin fuente local: los zips y discos se obtienen SOLO de los torrents.
@@ -497,6 +498,9 @@ def extract_archive(db_id, arc_id, arc, needed, tmp_dir):
     return ok, errors
 
 
+CLAIMED = {}   # ruta -> id de la primera DB que la declaro en esta corrida
+
+
 def process_db(db_cfg, glob_cfg, dest, workers, dry_run, fast):
     log(f"\n=== {db_cfg['id']} ===")
     try:
@@ -524,9 +528,14 @@ def process_db(db_cfg, glob_cfg, dest, workers, dry_run, fast):
 
     make_folders(db.get("folders"))
 
-    todo, skipped = [], 0
+    todo, skipped, dups = [], 0, 0
     for rel_path, entry in (db.get("files") or {}).items():
+        if CLAIMED.get(rel_path, db_cfg["id"]) != db_cfg["id"]:
+            dups += 1
+            continue
         status, path = plan_file(rel_path, entry, dest, tag_dict, pos, neg, fast)
+        if status in ("todo", "skip"):
+            CLAIMED[rel_path] = db_cfg["id"]
         if status == "todo":
             todo.append((rel_path, path, entry, file_url(entry, rel_path, base_url)))
         elif status == "skip":
@@ -549,7 +558,12 @@ def process_db(db_cfg, glob_cfg, dest, workers, dry_run, fast):
         make_folders(summary.get("folders"))
         needed = []
         for rel_path, entry in (summary.get("files") or {}).items():
+            if CLAIMED.get(rel_path, db_cfg["id"]) != db_cfg["id"]:
+                dups += 1
+                continue
             status, path = plan_file(rel_path, entry, dest, tag_dict, pos, neg, fast)
+            if status in ("todo", "skip"):
+                CLAIMED[rel_path] = db_cfg["id"]
             if status == "todo":
                 needed.append((rel_path, path, entry))
             elif status == "skip":
@@ -564,6 +578,8 @@ def process_db(db_cfg, glob_cfg, dest, workers, dry_run, fast):
 
     n_arc_files = sum(len(j[2]) for j in arc_jobs)
     log(f"{len(todo)} archivos + {n_arc_files} dentro de {len(arc_jobs)} zip(s) por procesar, {skipped} al dia")
+    if dups:
+        log(f"({dups} rutas ya las trae una DB anterior de la lista: gana la primera, se omiten aqui)")
 
     if dry_run:
         for rel_path, *_ in todo:
@@ -649,6 +665,7 @@ def run_update(args, root):
     log(f"Lista: {', '.join(f.name for f in ini_files)} | DBs: {len(dbs)}")
 
     total = {"ok": 0, "skipped": 0, "failed": 0}
+    CLAIMED.clear()
     HASHES.load(root, not args.no_hash_cache)
     try:
         for d in dbs:
